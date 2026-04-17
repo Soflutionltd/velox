@@ -58,7 +58,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    tracing::info!("AURA Inference Server listening on http://{addr}");
+    tracing::info!("Velox Inference Server listening on http://{addr}");
     tracing::info!("OpenAI API: http://{addr}/v1");
     tracing::info!("Anthropic API: http://{addr}/v1/messages");
     tracing::info!("Admin: http://{addr}/admin/status");

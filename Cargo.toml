@@ -1,10 +1,10 @@
 [package]
-name = "aura-inference"
+name = "velox"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "High-performance LLM inference server for Apple Silicon with tiered KV cache"
-repository = "https://github.com/Soflutionltd/aura-inference"
+description = "The world's first Rust-native LLM inference server for Apple Silicon. Blazing fast, zero GC, tiered KV cache."
+repository = "https://github.com/Soflutionltd/velox"
 authors = ["Antoine Pinelli <antoine@soflution.com>"]
 
 [dependencies]
@@ -45,9 +45,9 @@ mlx = []
 llamacpp = []
 
 [[bin]]
-name = "aura-inference"
+name = "velox"
 path = "src/main.rs"
 
 [lib]
-name = "aura_inference"
+name = "velox"
 path = "src/lib.rs"

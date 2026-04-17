@@ -1,9 +1,9 @@
-//! AURA Inference Server - library interface for Tauri integration
+//! Velox - The world's first Rust-native LLM inference server for Apple Silicon
 //!
 //! Usage from Tauri:
 //! ```rust
-//! let config = aura_inference::ServerConfig { ... };
-//! tokio::spawn(aura_inference::run_server(config));
+//! let config = velox::ServerConfig { ... };
+//! tokio::spawn(velox::run_server(config));
 //! ```
 
 pub mod config;

@@ -14,7 +14,7 @@ mod model;
 mod server;
 
 #[derive(Parser)]
-#[command(name = "aura-inference", about = "High-performance LLM inference server")]
+#[command(name = "velox", about = "Velox - The world's first Rust-native LLM inference server for Apple Silicon")]
 enum Cli {
     /// Start the inference server
     Serve {
@@ -47,7 +47,7 @@ enum Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("aura_inference=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("velox=info".parse()?))
         .init();
 
     let cli = Cli::parse();
@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
             hot_cache_pct,
             max_concurrent,
         } => {
-            tracing::info!("Starting AURA Inference Server on port {port}");
+            tracing::info!("Starting Velox Inference Server on port {port}");
             tracing::info!("Model directory: {model_dir}");
             tracing::info!("SSD cache: {ssd_cache_dir}");
 
