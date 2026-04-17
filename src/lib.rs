@@ -14,6 +14,7 @@ pub mod api;
 pub mod backend;
 pub mod cache;
 pub mod engine;
+pub mod memory;
 pub mod model;
 pub mod server;
 

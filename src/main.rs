@@ -9,6 +9,7 @@ mod api;
 mod backend;
 mod cache;
 mod engine;
+mod memory;
 mod model;
 mod server;
 

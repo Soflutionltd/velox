@@ -37,6 +37,7 @@ parking_lot = "0.12"
 bytes = "1"
 anyhow = "1"
 thiserror = "2"
+shellexpand = "3"
 
 [features]
 default = ["mlx"]
