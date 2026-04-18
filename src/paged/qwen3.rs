@@ -22,7 +22,10 @@ use candle_nn::{linear_b, linear_no_bias, rms_norm, Activation, Embedding, Linea
 use std::sync::Arc;
 
 #[cfg(all(target_os = "macos", feature = "candle-metal"))]
-use super::metal_kernels::{paged_decode_attention, ScatterSlot};
+use super::metal_kernels::{
+    batched_rope_decode, batched_scatter, paged_decode_attention, paged_prefill_attention,
+    ScatterSlot,
+};
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Qwen3Config {
@@ -231,22 +234,27 @@ impl PagedQwen3Attention {
         let k_all = k_all.reshape((total, self.num_kv_heads, self.head_dim))?;
         let v_all = v_all.reshape((total, self.num_kv_heads, self.head_dim))?;
 
-        // ---- Fused decode fast path -------------------------------------
+        // ---- Fused fast paths -------------------------------------------
         //
-        // When every sequence in the batch contributes exactly one new
-        // token (the steady-state case under continuous batching), we can
-        // collapse the per-seq attention loop — gather K, gather V,
-        // matmul Q·Kᵀ, softmax, matmul ·V — into one fused Metal kernel.
-        // This eliminates O(N · num_layers · ~5) GPU dispatches per step.
+        // We have two specialised Metal paths:
+        //   * forward_decode_fused : every seq has exactly 1 new token
+        //     (steady state under continuous batching).
+        //   * forward_prefill_fused : at least one seq has >1 new tokens,
+        //     i.e. we're admitting / chunked-prefilling. Both paths
+        //     collapse the per-seq attention loop (gather K, gather V,
+        //     Q·Kᵀ, softmax, ·V) into one Metal kernel dispatch per
+        //     layer.
         #[cfg(all(target_os = "macos", feature = "candle-metal"))]
         {
-            let pure_decode = !seqs.is_empty()
-                && seqs.iter().all(|s| s.new_tokens == 1)
-                && matches!(x.device(), Device::Metal(_))
+            let metal_ok = matches!(x.device(), Device::Metal(_))
                 && self.head_dim <= 256
                 && self.head_dim % 32 == 0;
-            if pure_decode {
-                return self.forward_decode_fused(&q_all, &k_all, &v_all, seqs, pages);
+            if metal_ok && !seqs.is_empty() {
+                let pure_decode = seqs.iter().all(|s| s.new_tokens == 1);
+                if pure_decode {
+                    return self.forward_decode_fused(&q_all, &k_all, &v_all, seqs, pages);
+                }
+                return self.forward_prefill_fused(&q_all, &k_all, &v_all, seqs, pages);
             }
         }
         // -----------------------------------------------------------------
@@ -321,24 +329,15 @@ impl PagedQwen3Attention {
         Tensor::cat(&outputs, 0).context("concat attention outputs").map_err(Into::into)
     }
 
-    /// Fused-decode fast path. Pre-conditions checked by caller:
-    ///   * every seq has `new_tokens == 1`
-    ///   * device is Metal
-    ///   * head_dim is 32-aligned and ≤ 256
+    /// Fused-decode fast path (pure decode: every seq has n_new=1).
     ///
-    /// Inputs:
-    ///   q_all : [N, H_q,  D]   (post-RMSNorm, pre-RoPE)
-    ///   k_all : [N, H_kv, D]   (post-RMSNorm, pre-RoPE)
-    ///   v_all : [N, H_kv, D]   (no norm, no RoPE)
-    ///
-    /// We:
-    ///   1) Apply RoPE to Q and K per-seq at their kv_offset (cheap, single
-    ///      token each), accumulate into a packed [N, H_q, D] / [N, H_kv, D].
-    ///   2) Scatter the new K and V into the layer pool (one inplace_op2
-    ///      per seq × (K|V), uses our custom MSL scatter kernel).
-    ///   3) Build block_table [N, MB] u32 and kv_lens [N] u32 tensors.
-    ///   4) Call paged_decode_attention → [N, H_q, D].
-    ///   5) o_proj.
+    /// Pipeline (all on Metal, ~3 dispatches per layer instead of N+5):
+    ///   1) batched_rope_decode on Q (in-place) using per-seq offsets
+    ///   2) batched_rope_decode on K (in-place) using per-seq offsets
+    ///   3) batched_scatter on K_pool with per-seq (page_id, slot)
+    ///   4) batched_scatter on V_pool with per-seq (page_id, slot)
+    ///   5) paged_decode_attention → [N, H_q, D]
+    ///   6) o_proj
     #[cfg(all(target_os = "macos", feature = "candle-metal"))]
     fn forward_decode_fused(
         &self,
@@ -350,50 +349,29 @@ impl PagedQwen3Attention {
     ) -> Result<Tensor> {
         let n = seqs.len();
         let h_q = self.num_heads;
-        let h_kv = self.num_kv_heads;
         let d = self.head_dim;
         let device = q_all.device();
         let dtype = q_all.dtype();
-
-        // 1) Per-seq RoPE then accumulate into packed buffers.
-        //    We collect q_rot rows and k_rot rows then cat once, then scatter.
-        let mut q_rows: Vec<Tensor> = Vec::with_capacity(n);
-        let mut k_rows: Vec<Tensor> = Vec::with_capacity(n);
-        let mut v_rows: Vec<Tensor> = Vec::with_capacity(n);
-
-        for (i, seq) in seqs.iter().enumerate() {
-            // Slice the i-th token from the packed batch.
-            let q_i = q_all.narrow(0, i, 1)?; // [1, H_q,  D]
-            let k_i = k_all.narrow(0, i, 1)?; // [1, H_kv, D]
-            let v_i = v_all.narrow(0, i, 1)?;
-
-            // RoPE wants [H, L=1, D]. transpose(0,1) flips the leading
-            // batch and head dims, giving [H, 1, D] directly (NO squeeze).
-            let q_for_rope = q_i.transpose(0, 1)?.contiguous()?; // [H_q, 1, D]
-            let k_for_rope = k_i.transpose(0, 1)?.contiguous()?; // [H_kv, 1, D]
-            let (q_rot, k_rot) = self
-                .rotary
-                .apply_at_offset(&q_for_rope, &k_for_rope, seq.kv_offset)?;
-            // Back to [1, H, D]
-            let q_rot = q_rot.transpose(0, 1)?.contiguous()?; // [1, H_q, D]
-            let k_rot = k_rot.transpose(0, 1)?.contiguous()?; // [1, H_kv, D]
-
-            q_rows.push(q_rot);
-            k_rows.push(k_rot);
-            v_rows.push(v_i);
-        }
-
-        let q_packed = Tensor::cat(&q_rows, 0)?.contiguous()?; // [N, H_q,  D]
-        let k_packed = Tensor::cat(&k_rows, 0)?.contiguous()?; // [N, H_kv, D]
-        let v_packed = Tensor::cat(&v_rows, 0)?.contiguous()?; // [N, H_kv, D]
-
-        // 2) Scatter the new K/V into the layer pool, one slot per seq.
-        let k_pool = pages.layer_k_pool(self.layer_idx);
-        let v_pool = pages.layer_v_pool(self.layer_idx);
         let page_size = pages.page_size();
 
-        for (i, seq) in seqs.iter().enumerate() {
-            let logical_pos = seq.kv_offset; // n_new=1, write at kv_offset
+        // 1+2) Per-seq RoPE on Q and K via the batched in-place kernel.
+        //      We need contiguous [N, H, D] tensors. q_all/k_all are already
+        //      that shape; just .contiguous() to drop any view stride.
+        let q_packed = q_all.contiguous()?;
+        let k_packed = k_all.contiguous()?;
+        let v_packed = v_all.contiguous()?;
+
+        let offsets: Vec<u32> = seqs.iter().map(|s| s.kv_offset as u32).collect();
+        let offsets_t = Tensor::from_vec(offsets, n, device)?;
+
+        batched_rope_decode(&q_packed, &self.rotary.cos, &self.rotary.sin, &offsets_t)?;
+        batched_rope_decode(&k_packed, &self.rotary.cos, &self.rotary.sin, &offsets_t)?;
+
+        // 3+4) Build (page_id, slot) per seq and batch-scatter K/V.
+        let mut page_ids = Vec::with_capacity(n);
+        let mut slots = Vec::with_capacity(n);
+        for seq in seqs {
+            let logical_pos = seq.kv_offset;
             let page_block = logical_pos / page_size;
             let slot = (logical_pos % page_size) as u32;
             let page_id = *seq.block_table.get(page_block).ok_or_else(|| {
@@ -404,15 +382,19 @@ impl PagedQwen3Attention {
                     seq.block_table.len()
                 )
             })?;
-
-            let k_t = k_packed.narrow(0, i, 1)?.squeeze(0)?; // [H_kv, D]
-            let v_t = v_packed.narrow(0, i, 1)?.squeeze(0)?;
-            scatter_into_pool(k_pool, &k_t, page_id, slot)?;
-            scatter_into_pool(v_pool, &v_t, page_id, slot)?;
+            page_ids.push(page_id);
+            slots.push(slot);
         }
+        let page_ids_t = Tensor::from_vec(page_ids, n, device)?;
+        let slots_t = Tensor::from_vec(slots, n, device)?;
 
-        // 3) Build block_table and kv_lens tensors.
-        //    kv_lens[i] = kv_offset[i] + 1  (the new token is now in the pool).
+        let k_pool = pages.layer_k_pool(self.layer_idx);
+        let v_pool = pages.layer_v_pool(self.layer_idx);
+
+        batched_scatter(k_pool, &k_packed, &page_ids_t, &slots_t)?;
+        batched_scatter(v_pool, &v_packed, &page_ids_t, &slots_t)?;
+
+        // 5) Block table + kv_lens for the fused attention kernel.
         let max_blocks = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(1);
         let mut bt = vec![0u32; n * max_blocks];
         for (i, seq) in seqs.iter().enumerate() {
@@ -424,7 +406,6 @@ impl PagedQwen3Attention {
         let kv_lens: Vec<u32> = seqs.iter().map(|s| (s.kv_offset + 1) as u32).collect();
         let kv_lens_t = Tensor::from_vec(kv_lens, n, device)?;
 
-        // 4) Fused attention.
         let scale = 1.0 / (d as f32).sqrt();
         let attn_out = paged_decode_attention(
             &q_packed,
@@ -435,11 +416,123 @@ impl PagedQwen3Attention {
             scale,
         )?; // [N, H_q, D]
 
-        // 5) o_proj. Reshape [N, H_q, D] → [N, H_q*D] = [N, hidden].
-        let attn_out = attn_out
-            .reshape((n, h_q * d))?
-            .to_dtype(dtype)?;
-        let _ = h_kv;
+        // 6) o_proj.
+        let attn_out = attn_out.reshape((n, h_q * d))?.to_dtype(dtype)?;
+        let out = self.o_proj.forward(&attn_out)?;
+        Ok(out)
+    }
+
+    /// Fused-prefill fast path (any batch with n_new ≥ 1, including
+    /// chunked-prefill admission steps).
+    ///
+    /// Pipeline:
+    ///   1) Build per-position absolute offsets, RoPE Q and K in place
+    ///      using the batched kernel.
+    ///   2) Build per-position (page_id, slot) and batch-scatter K and V.
+    ///   3) Build cu_seqlens, seq_id_per_q, kv_offsets tensors.
+    ///   4) paged_prefill_attention → [total_q, H_q, D].
+    ///   5) o_proj.
+    #[cfg(all(target_os = "macos", feature = "candle-metal"))]
+    fn forward_prefill_fused(
+        &self,
+        q_all: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        seqs: &[SeqSlice<'_>],
+        pages: &PagedKvCache,
+    ) -> Result<Tensor> {
+        let total_q = q_all.dim(0)?;
+        let h_q = self.num_heads;
+        let d = self.head_dim;
+        let device = q_all.device();
+        let dtype = q_all.dtype();
+        let page_size = pages.page_size();
+
+        // 1) Build per-token absolute RoPE offsets (one entry per packed
+        //    query position, accounting for kv_offset + position-in-seq).
+        let mut tok_offsets = Vec::with_capacity(total_q);
+        let mut tok_page_ids = Vec::with_capacity(total_q);
+        let mut tok_slots = Vec::with_capacity(total_q);
+        for seq in seqs {
+            for t in 0..seq.new_tokens {
+                let abs_pos = seq.kv_offset + t;
+                let page_block = abs_pos / page_size;
+                let slot = (abs_pos % page_size) as u32;
+                let page_id = *seq.block_table.get(page_block).ok_or_else(|| {
+                    anyhow!(
+                        "fused prefill: block_table too short: abs_pos={} needs block {}, have {}",
+                        abs_pos,
+                        page_block,
+                        seq.block_table.len()
+                    )
+                })?;
+                tok_offsets.push(abs_pos as u32);
+                tok_page_ids.push(page_id);
+                tok_slots.push(slot);
+            }
+        }
+        debug_assert_eq!(tok_offsets.len(), total_q);
+
+        let q_packed = q_all.contiguous()?;
+        let k_packed = k_all.contiguous()?;
+        let v_packed = v_all.contiguous()?;
+
+        let offsets_t = Tensor::from_vec(tok_offsets, total_q, device)?;
+        batched_rope_decode(&q_packed, &self.rotary.cos, &self.rotary.sin, &offsets_t)?;
+        batched_rope_decode(&k_packed, &self.rotary.cos, &self.rotary.sin, &offsets_t)?;
+
+        // 2) Batch-scatter K/V at (page_id, slot) per token.
+        let page_ids_t = Tensor::from_vec(tok_page_ids, total_q, device)?;
+        let slots_t = Tensor::from_vec(tok_slots, total_q, device)?;
+
+        let k_pool = pages.layer_k_pool(self.layer_idx);
+        let v_pool = pages.layer_v_pool(self.layer_idx);
+        batched_scatter(k_pool, &k_packed, &page_ids_t, &slots_t)?;
+        batched_scatter(v_pool, &v_packed, &page_ids_t, &slots_t)?;
+
+        // 3) Build cu_seqlens, seq_id_per_q, kv_offsets for the kernel.
+        let n = seqs.len();
+        let mut cu_seqlens = Vec::with_capacity(n + 1);
+        let mut seq_id_per_q = Vec::with_capacity(total_q);
+        let mut kv_offsets = Vec::with_capacity(n);
+        let mut acc = 0u32;
+        cu_seqlens.push(0u32);
+        for (i, seq) in seqs.iter().enumerate() {
+            for _ in 0..seq.new_tokens {
+                seq_id_per_q.push(i as u32);
+            }
+            acc += seq.new_tokens as u32;
+            cu_seqlens.push(acc);
+            kv_offsets.push(seq.kv_offset as u32);
+        }
+
+        let max_blocks = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(1);
+        let mut bt = vec![0u32; n * max_blocks];
+        for (i, seq) in seqs.iter().enumerate() {
+            for (j, b) in seq.block_table.iter().enumerate() {
+                bt[i * max_blocks + j] = *b;
+            }
+        }
+        let block_table = Tensor::from_vec(bt, (n, max_blocks), device)?;
+        let cu_t = Tensor::from_vec(cu_seqlens, n + 1, device)?;
+        let sid_t = Tensor::from_vec(seq_id_per_q, total_q, device)?;
+        let kvo_t = Tensor::from_vec(kv_offsets, n, device)?;
+
+        // 4) Fused varlen prefill attention with built-in causal mask.
+        let scale = 1.0 / (d as f32).sqrt();
+        let attn_out = paged_prefill_attention(
+            &q_packed,
+            k_pool,
+            v_pool,
+            &block_table,
+            &cu_t,
+            &sid_t,
+            &kvo_t,
+            scale,
+        )?; // [total_q, H_q, D]
+
+        // 5) o_proj.
+        let attn_out = attn_out.reshape((total_q, h_q * d))?.to_dtype(dtype)?;
         let out = self.o_proj.forward(&attn_out)?;
         Ok(out)
     }
