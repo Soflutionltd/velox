@@ -118,23 +118,35 @@ impl CandleBackend {
         true
     }
 
-    /// Build a paged scheduler for a Qwen3 model loaded on disk. Returns the
-    /// scheduler handle ready to accept submissions.
-    fn build_paged_qwen3(
-        path: &Path,
-        device: &Device,
-    ) -> anyhow::Result<PagedHandle> {
-        tracing::info!("Building paged Qwen3 from {:?}", path);
-        let cfg: PagedQwen3Config = load_arch_config(path)?;
+    /// Build a paged scheduler for a model that the paged backend
+    /// supports natively (Qwen3, Llama 3.x, Mistral). All these
+    /// families share the same paged engine — only the config parser
+    /// differs. The detected `arch` selects the parser; everything
+    /// downstream (pages, scheduler, tokenizer) is identical.
+    fn build_paged(path: &Path, device: &Device, arch: &str) -> anyhow::Result<PagedHandle> {
+        tracing::info!("Building paged engine from {:?} (arch={})", path, arch);
         let dtype = pick_dtype(path, device);
         let shards = discover_safetensors(path)?;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&shards, dtype, device)
                 .map_err(|e| anyhow::anyhow!("VarBuilder failed: {e}"))?
         };
-        let model = Arc::new(
-            PagedQwen3::load(&cfg, vb).map_err(|e| anyhow::anyhow!("PagedQwen3::load: {e}"))?,
-        );
+
+        let model = match arch {
+            "qwen3" => {
+                let cfg: PagedQwen3Config = load_arch_config(path)?;
+                Arc::new(
+                    PagedQwen3::load(&cfg, vb)
+                        .map_err(|e| anyhow::anyhow!("PagedQwen3::load: {e}"))?,
+                )
+            }
+            "llama" | "mistral" => Arc::new(
+                crate::paged::llama::load_paged_llama(path, vb)
+                    .map_err(|e| anyhow::anyhow!("load_paged_llama: {e}"))?,
+            ),
+            other => anyhow::bail!("paged backend does not (yet) support arch={}", other),
+        };
+        let cfg = model.config().clone();
 
         // KV pool sizing. Conservative: 256 pages × 16 tokens = 4K total
         // tokens of cache. For Qwen3-0.6B BF16, that's ~3.5 GB on Apple
@@ -205,10 +217,11 @@ impl InferenceBackend for CandleBackend {
             let arch = detect_architecture(&path_buf)?;
             tracing::info!("Loading Candle model from {:?} (arch={})", path_buf, arch);
 
-            // Qwen3 takes the new paged-attention path with continuous batching.
-            // Other architectures fall back to the sequential per-request path.
-            if arch == "qwen3" {
-                let paged = Self::build_paged_qwen3(&path_buf, &device)?;
+            // Qwen3, Llama 3.x and Mistral all take the paged-attention
+            // path with continuous batching. Other architectures fall
+            // back to the sequential per-request path below.
+            if matches!(arch.as_str(), "qwen3" | "llama" | "mistral") {
+                let paged = Self::build_paged(&path_buf, &device, &arch)?;
                 let id = uuid::Uuid::new_v4().to_string();
                 let handle = ModelHandle {
                     id: id.clone(),

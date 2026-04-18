@@ -68,6 +68,50 @@ pub struct QuantConfig {
     pub group_size: usize,
 }
 
+impl Qwen3Config {
+    /// Build a config for a Llama / Mistral checkpoint. Llama-family
+    /// models don't have q_norm/k_norm, attention bias, or sliding
+    /// window — those Qwen3-specific fields are zeroed and the
+    /// loader skips them via `Option::None` probing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_llama(
+        vocab_size: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        num_hidden_layers: usize,
+        num_attention_heads: usize,
+        head_dim: usize,
+        num_key_value_heads: usize,
+        max_position_embeddings: usize,
+        tie_word_embeddings: bool,
+        rope_theta: f64,
+        rms_norm_eps: f64,
+        hidden_act: Activation,
+        quantization: Option<QuantConfig>,
+    ) -> Self {
+        Self {
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            head_dim,
+            attention_bias: false,
+            num_key_value_heads,
+            max_position_embeddings,
+            sliding_window: None,
+            max_window_layers: 0,
+            tie_word_embeddings,
+            rope_theta,
+            rms_norm_eps,
+            use_sliding_window: false,
+            hidden_act,
+            quantization,
+            _quantization_config_ignored: None,
+        }
+    }
+}
+
 /// A linear layer that may be either a regular `Linear` or a 4-bit
 /// MLX-quant `QLinear`. Same forward interface either way.
 #[derive(Debug)]
@@ -299,8 +343,10 @@ struct PagedQwen3Attention {
     k_proj: MaybeQLinear,
     v_proj: MaybeQLinear,
     o_proj: MaybeQLinear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    /// Per-head RMSNorm on Q/K. Present in Qwen3 (the family's
+    /// signature trick), absent in Llama/Mistral/Gemma.
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -329,8 +375,10 @@ impl PagedQwen3Attention {
         let k_proj = maybe_qlinear(cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias, vb.pp("k_proj"), q_cfg)?;
         let v_proj = maybe_qlinear(cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias, vb.pp("v_proj"), q_cfg)?;
         let o_proj = maybe_qlinear(num_heads * head_dim, cfg.hidden_size, cfg.attention_bias, vb.pp("o_proj"), q_cfg)?;
-        let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        // q_norm/k_norm are optional: present in Qwen3 only. We probe
+        // the VarBuilder and default to None on absence.
+        let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
+        let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm")).ok();
         let hidden_size = head_dim * cfg.num_attention_heads;
         Ok(Self {
             q_proj,
@@ -367,18 +415,29 @@ impl PagedQwen3Attention {
         let k_all = self.k_proj.forward(x)?;
         let v_all = self.v_proj.forward(x)?;
 
-        // 2. Per-head RMSNorm on Q and K.
-        //    Reshape to [total, num_heads, head_dim] then norm over head_dim.
-        let q_all = q_all
-            .reshape((total, self.num_heads, self.head_dim))?
-            .reshape((total * self.num_heads, self.head_dim))?;
-        let k_all = k_all
-            .reshape((total, self.num_kv_heads, self.head_dim))?
-            .reshape((total * self.num_kv_heads, self.head_dim))?;
-        let q_all = self.q_norm.forward(&q_all)?;
-        let k_all = self.k_norm.forward(&k_all)?;
-        let q_all = q_all.reshape((total, self.num_heads, self.head_dim))?;
-        let k_all = k_all.reshape((total, self.num_kv_heads, self.head_dim))?;
+        // 2. Per-head RMSNorm on Q and K (Qwen3-only). For Llama /
+        //    Mistral / Gemma, q_norm/k_norm are None and we skip
+        //    straight to RoPE.
+        let (q_all, k_all) = match (&self.q_norm, &self.k_norm) {
+            (Some(qn), Some(kn)) => {
+                let q = q_all
+                    .reshape((total, self.num_heads, self.head_dim))?
+                    .reshape((total * self.num_heads, self.head_dim))?;
+                let k = k_all
+                    .reshape((total, self.num_kv_heads, self.head_dim))?
+                    .reshape((total * self.num_kv_heads, self.head_dim))?;
+                let q = qn.forward(&q)?;
+                let k = kn.forward(&k)?;
+                let q = q.reshape((total, self.num_heads, self.head_dim))?;
+                let k = k.reshape((total, self.num_kv_heads, self.head_dim))?;
+                (q, k)
+            }
+            _ => {
+                let q = q_all.reshape((total, self.num_heads, self.head_dim))?;
+                let k = k_all.reshape((total, self.num_kv_heads, self.head_dim))?;
+                (q, k)
+            }
+        };
         let v_all = v_all.reshape((total, self.num_kv_heads, self.head_dim))?;
 
         // ---- Fused fast paths -------------------------------------------
