@@ -16,6 +16,8 @@ pub mod cache;
 pub mod engine;
 pub mod memory;
 pub mod model;
+#[cfg(feature = "candle")]
+pub mod paged;
 pub mod server;
 
 pub use config::ServerConfig;

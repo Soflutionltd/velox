@@ -12,6 +12,9 @@
 // `mlx-lm` are resolved.
 
 use super::traits::*;
+use crate::paged::pages::{PagedKvCache, PagedKvConfig};
+use crate::paged::qwen3::{PagedQwen3, Qwen3Config as PagedQwen3Config};
+use crate::paged::scheduler::{BatchScheduler, SchedulerConfig, SubmitRequest};
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -78,8 +81,24 @@ struct LoadedCandleModel {
     dtype: DType,
 }
 
+/// A Qwen3 model loaded with the paged backend + a running BatchScheduler.
+struct PagedHandle {
+    scheduler: Arc<BatchScheduler>,
+    /// Background scheduler thread; we never join it during normal operation
+    /// (it runs forever until shutdown), but we keep the handle so `Drop`
+    /// can wait if needed.
+    _thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PagedHandle {
+    fn drop(&mut self) {
+        self.scheduler.shutdown();
+    }
+}
+
 pub struct CandleBackend {
     loaded: Arc<DashMap<String, Arc<LoadedCandleModel>>>,
+    paged: Arc<DashMap<String, Arc<PagedHandle>>>,
     device: Device,
 }
 
@@ -89,6 +108,7 @@ impl CandleBackend {
         tracing::info!("Candle backend initialised on device: {:?}", device);
         Self {
             loaded: Arc::new(DashMap::new()),
+            paged: Arc::new(DashMap::new()),
             device,
         }
     }
@@ -96,6 +116,66 @@ impl CandleBackend {
     /// Candle is available on every platform we currently target.
     pub fn available() -> bool {
         true
+    }
+
+    /// Build a paged scheduler for a Qwen3 model loaded on disk. Returns the
+    /// scheduler handle ready to accept submissions.
+    fn build_paged_qwen3(
+        path: &Path,
+        device: &Device,
+    ) -> anyhow::Result<PagedHandle> {
+        tracing::info!("Building paged Qwen3 from {:?}", path);
+        let cfg: PagedQwen3Config = load_arch_config(path)?;
+        let dtype = pick_dtype(path, device);
+        let shards = discover_safetensors(path)?;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&shards, dtype, device)
+                .map_err(|e| anyhow::anyhow!("VarBuilder failed: {e}"))?
+        };
+        let model = Arc::new(
+            PagedQwen3::load(&cfg, vb).map_err(|e| anyhow::anyhow!("PagedQwen3::load: {e}"))?,
+        );
+
+        // KV pool sizing. Conservative: 256 pages × 16 tokens = 4K total
+        // tokens of cache. For Qwen3-0.6B BF16, that's ~3.5 GB on Apple
+        // Silicon — reasonable for 16+ GB unified memory machines.
+        let pages_cfg = PagedKvConfig {
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            page_size: 16,
+            num_pages: 256,
+            dtype,
+        };
+        let pages = Arc::new(PagedKvCache::new(pages_cfg, device)?);
+
+        let tokenizer = Arc::new(load_tokenizer(path)?);
+        let chat_template = load_chat_template(path)?;
+        let eos_token_ids = read_eos_tokens(path, &tokenizer);
+
+        let scheduler = Arc::new(BatchScheduler::new(
+            model,
+            pages,
+            tokenizer,
+            chat_template,
+            eos_token_ids,
+            SchedulerConfig::default(),
+        ));
+
+        let sched_run = scheduler.clone();
+        let thread = std::thread::Builder::new()
+            .name("velox-batch-scheduler".to_string())
+            .spawn(move || {
+                if let Err(e) = sched_run.run() {
+                    tracing::error!("BatchScheduler thread crashed: {e:#}");
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("spawn scheduler thread: {e}"))?;
+
+        Ok(PagedHandle {
+            scheduler,
+            _thread: Some(thread),
+        })
     }
 }
 
@@ -118,11 +198,28 @@ impl InferenceBackend for CandleBackend {
     async fn load_model(&self, path: &Path) -> anyhow::Result<ModelHandle> {
         let path_buf = path.to_path_buf();
         let loaded_map = self.loaded.clone();
+        let paged_map = self.paged.clone();
         let device = self.device.clone();
 
         let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<ModelHandle> {
             let arch = detect_architecture(&path_buf)?;
             tracing::info!("Loading Candle model from {:?} (arch={})", path_buf, arch);
+
+            // Qwen3 takes the new paged-attention path with continuous batching.
+            // Other architectures fall back to the sequential per-request path.
+            if arch == "qwen3" {
+                let paged = Self::build_paged_qwen3(&path_buf, &device)?;
+                let id = uuid::Uuid::new_v4().to_string();
+                let handle = ModelHandle {
+                    id: id.clone(),
+                    path: path_buf.to_string_lossy().to_string(),
+                    model_type: ModelType::Llm,
+                    params_total: 0,
+                    params_active: 0,
+                };
+                paged_map.insert(id, Arc::new(paged));
+                return Ok(handle);
+            }
 
             let tokenizer = load_tokenizer(&path_buf)?;
             let chat_template = load_chat_template(&path_buf)?;
@@ -205,6 +302,7 @@ impl InferenceBackend for CandleBackend {
 
     async fn unload_model(&self, handle: &ModelHandle) -> anyhow::Result<()> {
         self.loaded.remove(&handle.id);
+        self.paged.remove(&handle.id);
         Ok(())
     }
 
@@ -213,6 +311,51 @@ impl InferenceBackend for CandleBackend {
         handle: &ModelHandle,
         request: &GenerateRequest,
     ) -> anyhow::Result<GenerateResult> {
+        // Paged path (Qwen3): submit to scheduler, accumulate stream.
+        if let Some(paged) = self.paged.get(&handle.id).map(|r| r.clone()) {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
+            let id = paged.scheduler.submit(SubmitRequest {
+                messages: request.messages.clone(),
+                prompt_tokens: request.prompt_tokens.clone(),
+                max_tokens: request.max_tokens.max(1),
+                temperature: request.temperature.max(0.0) as f64,
+                top_p: request.top_p.max(0.0).min(1.0) as f64,
+                stop_sequences: request.stop_sequences.clone(),
+                tx,
+            })?;
+            let mut text = String::new();
+            let mut tokens: Vec<u32> = Vec::new();
+            let mut prompt_tokens = 0u32;
+            let mut completion_tokens = 0u32;
+            let mut finish_reason = String::from("stop");
+            while let Some(chunk) = rx.recv().await {
+                match chunk {
+                    StreamChunk::Token { token_id, text_delta } => {
+                        tokens.push(token_id);
+                        text.push_str(&text_delta);
+                    }
+                    StreamChunk::Done {
+                        finish_reason: r,
+                        prompt_tokens: pt,
+                        completion_tokens: ct,
+                    } => {
+                        finish_reason = r;
+                        prompt_tokens = pt;
+                        completion_tokens = ct;
+                    }
+                    StreamChunk::Error(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+            let _ = id;
+            return Ok(GenerateResult {
+                tokens,
+                text,
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+            });
+        }
+
         let model_arc = self
             .loaded
             .get(&handle.id)
@@ -281,6 +424,22 @@ impl InferenceBackend for CandleBackend {
         handle: &ModelHandle,
         request: &GenerateRequest,
     ) -> anyhow::Result<BoxStream<'static, StreamChunk>> {
+        // Paged path: route directly through scheduler. Streaming is native.
+        if let Some(paged) = self.paged.get(&handle.id).map(|r| r.clone()) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
+            paged.scheduler.submit(SubmitRequest {
+                messages: request.messages.clone(),
+                prompt_tokens: request.prompt_tokens.clone(),
+                max_tokens: request.max_tokens.max(1),
+                temperature: request.temperature.max(0.0) as f64,
+                top_p: request.top_p.max(0.0).min(1.0) as f64,
+                stop_sequences: request.stop_sequences.clone(),
+                tx,
+            })?;
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            return Ok(Box::pin(stream));
+        }
+
         let model_arc = self
             .loaded
             .get(&handle.id)

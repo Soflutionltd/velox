@@ -11,6 +11,8 @@ mod cache;
 mod engine;
 mod memory;
 mod model;
+#[cfg(feature = "candle")]
+mod paged;
 mod server;
 
 #[derive(Parser)]
