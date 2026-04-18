@@ -3548,6 +3548,8 @@ dependencies = [
  "dashmap",
  "futures",
  "hf-hub",
+ "hyper",
+ "hyper-util",
  "memmap2",
  "minijinja",
  "minijinja-contrib",

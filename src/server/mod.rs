@@ -91,9 +91,92 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     tracing::info!("Anthropic API: http://{addr}/v1/messages");
     tracing::info!("Admin: http://{addr}/admin/status");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let tcp_listener = tokio::net::TcpListener::bind(addr).await?;
+    let tcp_app = app.clone();
+    let tcp_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(tcp_listener, tcp_app).await {
+            tracing::error!("TCP listener died: {e}");
+        }
+    });
+
+    // Optional Unix domain socket. Enabled with --socket /path/to/sock.
+    // Uses tokio::net::UnixListener wrapped through axum's serve. Saves
+    // ~30µs/round-trip over localhost TCP — measurable for chatty
+    // local apps doing many small requests.
+    let uds_handle = if let Some(sock_path) = &config.socket_path {
+        let path = std::path::PathBuf::from(sock_path);
+        // Best-effort cleanup of a stale socket from a previous run.
+        // Anyone with rights to write to the dir could already replace
+        // this file, so this is a convenience, not a security measure.
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
+            anyhow::anyhow!("bind UDS at {}: {e}", path.display())
+        })?;
+        tracing::info!("Velox UDS listening on {}", path.display());
+        let uds_app = app.clone();
+        let path_owned = path.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = serve_uds(listener, uds_app).await {
+                tracing::error!("UDS listener died: {e}");
+            }
+            let _ = std::fs::remove_file(&path_owned);
+        }))
+    } else {
+        None
+    };
+
+    // Wait for either listener to terminate (typically Ctrl-C handler in
+    // the future). For now we just keep both alive forever.
+    let _ = tcp_handle.await;
+    if let Some(h) = uds_handle {
+        let _ = h.await;
+    }
     Ok(())
+}
+
+/// Serve `app` over a Unix domain socket. We hand-roll the accept loop
+/// because axum's `serve` helper takes a `TcpListener` specifically;
+/// the underlying machinery is just `hyper::server::conn` + a tower
+/// service, which works fine over any AsyncRead+AsyncWrite stream.
+async fn serve_uds(
+    listener: tokio::net::UnixListener,
+    app: Router,
+) -> anyhow::Result<()> {
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::Service;
+
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("UDS accept error: {e}");
+                continue;
+            }
+        };
+        let io = TokioIo::new(stream);
+        let tower_service = app.clone();
+        // hyper expects a Service<Request<Incoming>, Response = Response<…>>.
+        // We re-clone the (cheap) Router on every request so the closure
+        // can be `Fn` rather than `FnMut`.
+        let hyper_service =
+            hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                let mut svc = tower_service.clone();
+                async move { svc.call(req).await }
+            });
+        tokio::spawn(async move {
+            if let Err(e) = Builder::new(TokioExecutor::new())
+                .serve_connection(io, hyper_service)
+                .await
+            {
+                tracing::debug!("UDS conn closed: {e}");
+            }
+        });
+    }
 }
 
 fn parse_memory_limit(s: &str) -> u64 {

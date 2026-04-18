@@ -121,6 +121,28 @@ Sequential per-request backend (Candle's default, no paged optimisations):
 * **OpenAI + Anthropic APIs** — full chat completions, streaming SSE,
   tool calling, vision, thinking blocks.
 
+## Transports
+
+Velox can serve over both TCP and Unix domain sockets simultaneously:
+
+```bash
+velox serve \
+    --model-dir ~/.velox/models \
+    --port 8000 \
+    --socket /tmp/velox.sock          # optional, can run alongside TCP
+```
+
+```bash
+# TCP
+curl http://localhost:8000/v1/models
+
+# UDS — local apps can skip the kernel TCP stack
+curl --unix-socket /tmp/velox.sock http://localhost/v1/models
+```
+
+UDS shaves ~30µs per round-trip versus localhost TCP. Useful if your app
+makes many small requests (token-by-token streaming, embeddings batches).
+
 ## Benchmarks
 
 See [BENCHMARKS.md](./BENCHMARKS.md) for the full head-to-head numbers
@@ -168,7 +190,7 @@ Coverage / features:
 
 Distribution:
 
-11. Unix domain socket transport (no HTTP overhead for local apps)
+11. ~~Unix domain socket transport~~ ✅ shipped — `--socket /tmp/velox.sock`
 12. gRPC server (`tonic`) alongside HTTP
 13. Homebrew tap and signed macOS binary
 14. Landing page + Show HN

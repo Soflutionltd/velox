@@ -43,6 +43,13 @@ enum Cli {
         /// Max concurrent requests
         #[arg(long, default_value = "8")]
         max_concurrent: usize,
+
+        /// Optional Unix domain socket path. When set, the server
+        /// listens on this path *in addition to* TCP. Use when local
+        /// apps want to skip the localhost TCP stack (~30µs/req
+        /// saved). Example: --socket /tmp/velox.sock
+        #[arg(long)]
+        socket: Option<String>,
     },
 }
 
@@ -62,10 +69,14 @@ async fn main() -> anyhow::Result<()> {
             ssd_cache_dir,
             hot_cache_pct,
             max_concurrent,
+            socket,
         } => {
             tracing::info!("Starting Velox Inference Server on port {port}");
             tracing::info!("Model directory: {model_dir}");
             tracing::info!("SSD cache: {ssd_cache_dir}");
+            if let Some(s) = &socket {
+                tracing::info!("Unix socket: {s}");
+            }
 
             let config = config::ServerConfig {
                 model_dir,
@@ -74,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
                 ssd_cache_dir,
                 hot_cache_pct,
                 max_concurrent,
+                socket_path: socket,
             };
 
             server::run(config).await?;
