@@ -50,6 +50,12 @@ enum Cli {
         /// saved). Example: --socket /tmp/velox.sock
         #[arg(long)]
         socket: Option<String>,
+
+        /// Optional gRPC port. When set, the server exposes a typed
+        /// tonic-based gRPC API in parallel to HTTP. Schema lives in
+        /// proto/velox.proto. Example: --grpc-port 50051
+        #[arg(long)]
+        grpc_port: Option<u16>,
     },
 }
 
@@ -70,12 +76,16 @@ async fn main() -> anyhow::Result<()> {
             hot_cache_pct,
             max_concurrent,
             socket,
+            grpc_port,
         } => {
             tracing::info!("Starting Velox Inference Server on port {port}");
             tracing::info!("Model directory: {model_dir}");
             tracing::info!("SSD cache: {ssd_cache_dir}");
             if let Some(s) = &socket {
                 tracing::info!("Unix socket: {s}");
+            }
+            if let Some(g) = grpc_port {
+                tracing::info!("gRPC port: {g}");
             }
 
             let config = config::ServerConfig {
@@ -86,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 hot_cache_pct,
                 max_concurrent,
                 socket_path: socket,
+                grpc_port,
             };
 
             server::run(config).await?;

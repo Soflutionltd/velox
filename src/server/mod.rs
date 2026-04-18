@@ -1,6 +1,7 @@
 pub mod routes;
 pub mod sse;
 pub mod middleware;
+pub mod grpc;
 
 use crate::config::ServerConfig;
 use crate::backend;
@@ -78,12 +79,15 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         config: config.clone(),
     };
 
+    // Clone state for each consumer (HTTP router + gRPC service);
+    // it's just an Arc bundle so the clone is cheap.
+    let state_for_router = state.clone();
     let app = Router::new()
         .merge(routes::openai_routes())
         .merge(routes::anthropic_routes())
         .merge(routes::admin_routes())
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state_for_router);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     tracing::info!("Velox Inference Server listening on http://{addr}");
@@ -128,10 +132,34 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         None
     };
 
-    // Wait for either listener to terminate (typically Ctrl-C handler in
-    // the future). For now we just keep both alive forever.
+    // Optional gRPC listener. Different port from HTTP because tonic
+    // wants exclusive control of an HTTP/2 socket — colocating with
+    // axum on the same port is doable via a tower router, but the
+    // ergonomic + perf hit isn't worth it for a side-channel.
+    let grpc_handle = if let Some(grpc_port) = config.grpc_port {
+        let grpc_addr: SocketAddr = ([0, 0, 0, 0], grpc_port).into();
+        tracing::info!("Velox gRPC listening on grpc://{grpc_addr}");
+        let svc = grpc::VeloxService::new(state.clone()).into_server();
+        Some(tokio::spawn(async move {
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve(grpc_addr)
+                .await
+            {
+                tracing::error!("gRPC server died: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Wait for any listener to terminate (typically Ctrl-C handler in
+    // the future). For now we just keep them all alive forever.
     let _ = tcp_handle.await;
     if let Some(h) = uds_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = grpc_handle {
         let _ = h.await;
     }
     Ok(())

@@ -15,6 +15,12 @@ pub struct ServerConfig {
     /// latency-sensitive local apps integrating Velox.
     #[serde(default)]
     pub socket_path: Option<String>,
+    /// Optional gRPC port. When set, Velox spins up a tonic-based
+    /// gRPC server alongside the HTTP one. Useful for typed clients
+    /// (Rust/Go/Swift/Python) that want HTTP/2 multiplexing without
+    /// JSON parsing on every chunk.
+    #[serde(default)]
+    pub grpc_port: Option<u16>,
 }
 
 impl Default for ServerConfig {
@@ -27,6 +33,7 @@ impl Default for ServerConfig {
             hot_cache_pct: 20,
             max_concurrent: 8,
             socket_path: None,
+            grpc_port: None,
         }
     }
 }

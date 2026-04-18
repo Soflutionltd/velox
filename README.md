@@ -123,25 +123,34 @@ Sequential per-request backend (Candle's default, no paged optimisations):
 
 ## Transports
 
-Velox can serve over both TCP and Unix domain sockets simultaneously:
+Velox can serve over **TCP**, **Unix domain socket**, and **gRPC** simultaneously:
 
 ```bash
 velox serve \
     --model-dir ~/.velox/models \
     --port 8000 \
-    --socket /tmp/velox.sock          # optional, can run alongside TCP
+    --socket /tmp/velox.sock \   # optional, ~30µs/req faster than localhost TCP
+    --grpc-port 50051            # optional, typed schema + HTTP/2 multiplexing
 ```
 
 ```bash
-# TCP
+# HTTP / TCP — OpenAI + Anthropic compatible
 curl http://localhost:8000/v1/models
 
-# UDS — local apps can skip the kernel TCP stack
+# HTTP / UDS — same API, no kernel TCP stack
 curl --unix-socket /tmp/velox.sock http://localhost/v1/models
+
+# gRPC — typed clients (Rust/Go/Swift/Python), HTTP/2 streaming
+grpcurl -plaintext -import-path proto -proto velox.proto \
+    localhost:50051 velox.v1.Velox/ListModels
+grpcurl -plaintext -import-path proto -proto velox.proto \
+    -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"Hi"}],"max_tokens":50}' \
+    localhost:50051 velox.v1.Velox/Generate
 ```
 
-UDS shaves ~30µs per round-trip versus localhost TCP. Useful if your app
-makes many small requests (token-by-token streaming, embeddings batches).
+The schema lives in [`proto/velox.proto`](./proto/velox.proto). Generate
+clients with `tonic-build` (Rust), `protoc-gen-go` (Go), `swift-protobuf`
+(Swift), or `grpcio-tools` (Python).
 
 ## Benchmarks
 
@@ -191,7 +200,7 @@ Coverage / features:
 Distribution:
 
 11. ~~Unix domain socket transport~~ ✅ shipped — `--socket /tmp/velox.sock`
-12. gRPC server (`tonic`) alongside HTTP
+12. ~~gRPC server (`tonic`) alongside HTTP~~ ✅ shipped — `--grpc-port 50051`
 13. Homebrew tap and signed macOS binary
 14. Landing page + Show HN
 

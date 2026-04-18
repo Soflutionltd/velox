@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package velox.v1;
+
+// Velox is a typed gRPC surface alongside the OpenAI/Anthropic HTTP
+// API. It exposes the *minimum* needed for embedding Velox into a
+// typed Rust/Go/Python/Swift client without paying the JSON parsing
+// + reflection cost on every token.
+service Velox {
+  // List loaded models.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Server-streaming generation. Client gets back a stream of
+  // ChatChunk messages, each carrying an incremental text delta and
+  // optionally a finish reason on the last one.
+  rpc Generate(GenerateRequest) returns (stream ChatChunk);
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated string ids = 1;
+}
+
+message Message {
+  string role = 1;        // "system" | "user" | "assistant"
+  string content = 2;
+}
+
+message GenerateRequest {
+  string model = 1;
+  repeated Message messages = 2;
+  uint32 max_tokens = 3;
+  // 0.0 = greedy. Anything > 0 enables sampling with temperature.
+  float temperature = 4;
+  // Nucleus sampling threshold. 1.0 = disabled.
+  float top_p = 5;
+  // Optional stop strings; generation halts on first match.
+  repeated string stop = 6;
+}
+
+message ChatChunk {
+  // Incremental text since the previous chunk. Empty on the final
+  // chunk that carries only the finish reason.
+  string text_delta = 1;
+  // Token id of the most recently generated token (0 on the final
+  // chunk if no token was produced this step).
+  uint32 token_id = 2;
+  // Set on the LAST chunk only. One of: "stop" | "length" |
+  // "cancelled" | "error".
+  string finish_reason = 3;
+  // Set on the LAST chunk only. Counters for token accounting.
+  uint32 prompt_tokens = 4;
+  uint32 completion_tokens = 5;
+  // Set on the LAST chunk only when finish_reason == "error".
+  string error = 6;
+}

@@ -15,6 +15,9 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+tonic = "0.12"
+prost = "0.13"
+async-stream = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -67,6 +70,9 @@ mlx-lm-utils = { git = "https://github.com/oxideai/mlx-rs", branch = "main", opt
 
 # HuggingFace model download
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [features]
 # On Apple Silicon, the default is Candle + Metal GPU acceleration.
