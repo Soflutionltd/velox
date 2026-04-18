@@ -22,7 +22,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-RESULTS = ROOT / "scripts" / "bench_results.json"
+import os
+RESULTS_NAME = os.environ.get("BENCH_RESULTS", "bench_results.json")
+RESULTS = ROOT / "scripts" / RESULTS_NAME
 OUT_DIR = ROOT / "assets"
 OUT_DIR.mkdir(exist_ok=True)
 

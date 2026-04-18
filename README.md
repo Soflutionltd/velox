@@ -11,9 +11,9 @@
 </p>
 
 <p align="center">
-  <a href="#benchmarks"><img alt="Throughput" src="https://img.shields.io/badge/throughput-471%20tok%2Fs%20%4016%20users-FF6A1A?style=flat-square"></a>
-  <a href="#benchmarks"><img alt="vs Ollama" src="https://img.shields.io/badge/vs%20Ollama-2.20%C3%97%20faster%20under%20load-FF6A1A?style=flat-square"></a>
-  <a href="#benchmarks"><img alt="vs Ollama p95" src="https://img.shields.io/badge/p95%20latency-2.18%C3%97%20lower-FF6A1A?style=flat-square"></a>
+  <a href="#benchmarks"><img alt="Throughput" src="https://img.shields.io/badge/throughput-547%20tok%2Fs%20%4016%20users-FF6A1A?style=flat-square"></a>
+  <a href="#benchmarks"><img alt="vs Ollama" src="https://img.shields.io/badge/vs%20Ollama-2.73%C3%97%20faster%20under%20load-FF6A1A?style=flat-square"></a>
+  <a href="#benchmarks"><img alt="vs Ollama p95" src="https://img.shields.io/badge/p95%20latency-2.77%C3%97%20lower-FF6A1A?style=flat-square"></a>
   <a href="vendor/mlx-quantized/"><img alt="MLX kernels" src="https://img.shields.io/badge/Apple%20MLX%20kernels-ported-success?style=flat-square"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"></a>
 </p>
@@ -70,12 +70,12 @@ Velox occupies the empty quadrant: **a real serving engine for Apple Silicon** �
 
 | Concurrency | Velox (tok/s) | Ollama (tok/s) | Velox advantage |
 |---:|---:|---:|:---:|
-| 1 user | 89.5 | **194.0** | Ollama 2.17× *(see note below)* |
-| 4 users | 208.9 | 211.4 | tie |
-| 8 users | **350.9** | 213.8 | **Velox +64%** |
-| 16 users | **471.0** | 214.0 | **Velox +120%** |
+| 1 user | 92.7 | **182.9** | Ollama 1.97× *(see note below)* |
+| 4 users | **223.0** | 201.0 | **Velox +11%** |
+| 8 users | **394.8** | 197.7 | **Velox +100% (2.0×)** |
+| 16 users | **546.9** | 200.5 | **Velox +173% (2.73×)** |
 
-Ollama's throughput **plateaus at ~214 tok/s no matter how many users you throw at it** — it serves requests sequentially. Velox **scales 5.3×** from 1→16 users thanks to continuous batching + paged KV cache.
+Ollama's throughput **plateaus at ~200 tok/s no matter how many users you throw at it** — it serves requests sequentially. Velox **scales 5.9×** from 1→16 users thanks to continuous batching + paged KV cache + batched GPU-side argmax sampling.
 
 ### 2. Tail latency under load (p95, lower is better)
 
@@ -83,12 +83,12 @@ Ollama's throughput **plateaus at ~214 tok/s no matter how many users you throw 
 
 | Concurrency | Velox p95 | Ollama p95 | Velox advantage |
 |---:|---:|---:|:---:|
-| 1 user | 1.5 s | 0.7 s | Ollama 2.1× |
-| 4 users | 2.5 s | 2.5 s | tie |
-| 8 users | **3.0 s** | 4.9 s | **Velox 1.63× lower** |
-| 16 users | **4.4 s** | 9.6 s | **Velox 2.18× lower** |
+| 1 user | 1.4 s | 0.7 s | Ollama 2.0× |
+| 4 users | 2.3 s | 2.6 s | **Velox 1.13× lower** |
+| 8 users | **2.6 s** | 5.4 s | **Velox 2.06× lower** |
+| 16 users | **3.7 s** | 10.4 s | **Velox 2.77× lower** |
 
-Above 8 concurrent users, Velox holds latency flat while Ollama collapses linearly with load.
+Above 4 concurrent users, Velox holds latency flat while Ollama collapses linearly with load.
 
 ### 3. Velox kernel internals — Apple's MLX kernels, ported
 
@@ -252,7 +252,7 @@ The schema lives in [`proto/velox.proto`](./proto/velox.proto). Generate clients
 5. ☐ **Port `qmv_quad`** quad-axis dispatch (commit 5/6)
 6. ☐ **Port full MLX dispatcher** + remove opt-in flag (commit 6/6)
 7. ☐ **Fused decode layer kernels** — one Metal dispatch per layer instead of ~14
-8. ☐ **GPU-side argmax** in normal decode (already done in spec drafter)
+8. ✅ **GPU-side batched argmax** — single sync per step instead of N (greedy fast path), +16% throughput at 16 users
 
 ### Concurrent perf (push the lead further)
 

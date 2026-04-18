@@ -376,10 +376,27 @@ impl BatchScheduler {
         // logits shape: [num_reqs, vocab]. One row per request, at the
         // position of its LAST new token.
 
-        // Per-request: sample, advance state, stream.
+        // Sample one token per row in a SINGLE GPU→CPU sync when possible.
+        //
+        // The naive path (used until commit `feat(perf): GPU-side argmax`)
+        // pulled the entire `[vocab]` logits row to the CPU N times per
+        // step (once per running request), then ran argmax/top-p in pure
+        // Rust. With Qwen3 vocab = 151K and 16 concurrent users that is
+        // ~10 MB of GPU→CPU transfer + 16 sync points per generated
+        // token — purely wasted bandwidth when we just want one u32 per
+        // row.
+        //
+        // `sample_batch` instead detects greedy batches and dispatches a
+        // single Metal `fast_argmax_*` reduce, then transfers exactly
+        // `4 * num_reqs` bytes back to host. Mixed-mode batches (some
+        // requests greedy, some stochastic) still benefit because the
+        // greedy rows are batched and the stochastic ones keep the old
+        // per-row sampling path (they need the full logits anyway).
+        let next_tokens = sample_batch(&logits, &seq_specs, &running)?;
+
+        // Per-request: advance state, stream.
         let mut to_remove: Vec<RequestId> = Vec::new();
         for (row, spec) in seq_specs.iter().enumerate() {
-            let row_logits = logits.i(row)?.contiguous()?;
             let req = running
                 .get_mut(&spec.id)
                 .expect("request still in running map");
@@ -391,10 +408,7 @@ impl BatchScheduler {
             // chunk we sent. The LAST token of that chunk is the one whose
             // logits we just sampled, which gives us the FIRST generated
             // token. Otherwise we're in pure decode mode.
-            let mut sampler = make_sampler(req.temperature, req.top_p);
-            let next = sampler
-                .sample(&row_logits)
-                .map_err(|e| anyhow!("sampler: {e}"))?;
+            let next = next_tokens[row];
 
             // If we still need to prefill more (the prompt was longer than
             // a single chunk allowed), the sampled token is just lookahead;
@@ -536,6 +550,79 @@ fn make_sampler(temperature: f64, top_p: f64) -> LogitsProcessor {
     } else {
         LogitsProcessor::from_sampling(rand::random(), Sampling::TopP { p: top_p, temperature })
     }
+}
+
+/// Whether a request samples greedily (temperature ≈ 0).
+#[inline]
+fn is_greedy(temperature: f64) -> bool {
+    temperature <= 1e-7
+}
+
+/// Sample one token per row of `logits` in as few GPU→CPU syncs as possible.
+///
+/// `logits` has shape `[num_reqs, vocab]`. We return a `Vec<u32>` of length
+/// `num_reqs`, one sampled token id per row, in the same order as
+/// `seq_specs`.
+///
+/// Strategy:
+/// * If **every** row is greedy, we run a single `argmax` reduction on the
+///   whole `[num_reqs, vocab]` tensor (one Metal dispatch) and pull
+///   `num_reqs` u32s back. This is the hot path during benchmarks and any
+///   `temperature=0` workload (code, structured output, eval suites).
+/// * Otherwise we fall back to per-row sampling via Candle's
+///   `LogitsProcessor`. This is correct but slower because each row pulls
+///   the full `[vocab]` of f32s to the CPU.
+///
+/// We deliberately do NOT try to do partial GPU argmax + per-row CPU
+/// sampling here. The mixed case is rare in practice (most batches are
+/// homogeneous), and the bookkeeping/branching cost of doing it is not
+/// worth the marginal speedup we could squeeze out.
+fn sample_batch(
+    logits: &Tensor,
+    seq_specs: &[SeqSpec],
+    running: &HashMap<RequestId, Request>,
+) -> Result<Vec<u32>> {
+    debug_assert_eq!(
+        logits.dims().first().copied(),
+        Some(seq_specs.len()),
+        "logits batch dim must match seq_specs len"
+    );
+
+    let all_greedy = seq_specs
+        .iter()
+        .all(|s| running.get(&s.id).map(|r| is_greedy(r.temperature)).unwrap_or(true));
+
+    if all_greedy {
+        // FAST PATH: one Metal `fast_argmax_*` over the whole batch, one
+        // sync of `4 * num_reqs` bytes.
+        let ids = logits
+            .argmax(candle_core::D::Minus1)
+            .map_err(|e| anyhow!("batched argmax: {e}"))?;
+        let ids = match ids.dtype() {
+            candle_core::DType::U32 => ids,
+            _ => ids
+                .to_dtype(candle_core::DType::U32)
+                .map_err(|e| anyhow!("argmax cast: {e}"))?,
+        };
+        let v = ids
+            .to_vec1::<u32>()
+            .map_err(|e| anyhow!("argmax sync: {e}"))?;
+        return Ok(v);
+    }
+
+    // SLOW PATH: per-row sampling for non-greedy batches.
+    let mut out = Vec::with_capacity(seq_specs.len());
+    for (row, spec) in seq_specs.iter().enumerate() {
+        let row_logits = logits.i(row)?.contiguous()
+            .map_err(|e| anyhow!("logits row {row}: {e}"))?;
+        let req = running.get(&spec.id).expect("request still in running map");
+        let mut sampler = make_sampler(req.temperature, req.top_p);
+        let next = sampler
+            .sample(&row_logits)
+            .map_err(|e| anyhow!("sampler row {row}: {e}"))?;
+        out.push(next);
+    }
+    Ok(out)
 }
 
 /// Render a Hugging Face Jinja2 chat template with minijinja + pycompat.

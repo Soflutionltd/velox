@@ -28,12 +28,14 @@ Each benchmark: warmup pass, then 3 timed runs per regime, p50/p95 aggregated ac
 
 |  Concurrency  |  Velox tok/s  |  Ollama tok/s  |  Velox advantage  |
 |--------------:|--------------:|---------------:|:-----------------:|
-|  1 user       |        89.5   |     **194.0**  | Ollama 2.17×      |
-|  4 users      |       208.9   |       211.4    | tie               |
-|  8 users      |    **350.9**  |       213.8    | **Velox +64%**    |
-|  16 users     |    **471.0**  |       214.0    | **Velox +120%**   |
+|  1 user       |        92.7   |     **182.9**  | Ollama 1.97×      |
+|  4 users      |    **223.0**  |       201.0    | **Velox +11%**    |
+|  8 users      |    **394.8**  |       197.7    | **Velox +100%**   |
+|  16 users     |    **546.9**  |       200.5    | **Velox +173%**   |
 
-**Key finding:** Ollama plateaus at ~214 tok/s regardless of load — it's a sequential request pipeline. Velox's continuous batching scales 5.3× from 1→16 users.
+**Key finding:** Ollama plateaus at ~200 tok/s regardless of load — it's a sequential request pipeline. Velox's continuous batching + batched GPU-side argmax sampling scale **5.9×** from 1→16 users.
+
+**Update vs previous bench (commit `2a458a6` → this commit):** the GPU-side argmax patch landed in `scheduler.rs::sample_batch` collapses N per-token GPU→CPU syncs (one per running request, ~600 KB each on Qwen3 vocab=151K) into **a single 4·N-byte sync**. Effect is proportional to concurrency — single-stream gained +3.6%, while 16-user batches gained +16% on top of the already-strong baseline.
 
 ---
 
@@ -43,12 +45,12 @@ Each benchmark: warmup pass, then 3 timed runs per regime, p50/p95 aggregated ac
 
 | Concurrency | Velox p95 | Ollama p95 | Velox advantage |
 |------------:|----------:|-----------:|:---------------:|
-| 1 user      |    1.5 s  |     0.7 s  | Ollama 2.1×     |
-| 4 users     |    2.5 s  |     2.5 s  | tie             |
-| 8 users     |  **3.0 s**|     4.9 s  | **Velox 1.63×** |
-| 16 users    |  **4.4 s**|     9.6 s  | **Velox 2.18×** |
+| 1 user      |    1.4 s  |     0.7 s  | Ollama 2.0×     |
+| 4 users     |    2.3 s  |     2.6 s  | **Velox 1.13×** |
+| 8 users     |  **2.6 s**|     5.4 s  | **Velox 2.06×** |
+| 16 users    |  **3.7 s**|    10.4 s  | **Velox 2.77×** |
 
-Above 4 users, Ollama's latency grows linearly with load. Velox's stays flat.
+Above 4 users, Ollama's latency grows linearly with load. Velox's stays nearly flat.
 
 ---
 

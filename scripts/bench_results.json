@@ -16,9 +16,9 @@
       "total_tokens": 0,
       "wall_seconds": 0.0,
       "tokens_per_second": 0.0,
-      "p50_latency_ms": 24.352417007321492,
-      "p95_latency_ms": 24.475958984112367,
-      "ttft_ms": 24.352417007321492
+      "p50_latency_ms": 24.254583986476064,
+      "p95_latency_ms": 24.41158299916424,
+      "ttft_ms": 24.254583986476064
     },
     {
       "backend": "velox",
@@ -27,10 +27,10 @@
       "n_requests": 3,
       "tokens_per_request": 128,
       "total_tokens": 384,
-      "wall_seconds": 4.291551540984074,
-      "tokens_per_second": 89.47812844208482,
-      "p50_latency_ms": 1435.5903329851571,
-      "p95_latency_ms": 1450.397749984404,
+      "wall_seconds": 4.142628708010307,
+      "tokens_per_second": 92.6947663104556,
+      "p50_latency_ms": 1381.9620409922209,
+      "p95_latency_ms": 1383.7078330107033,
       "ttft_ms": null
     },
     {
@@ -40,10 +40,10 @@
       "n_requests": 12,
       "tokens_per_request": 128,
       "total_tokens": 1536,
-      "wall_seconds": 7.352084540994838,
-      "tokens_per_second": 208.92033972614766,
-      "p50_latency_ms": 2463.661895992118,
-      "p95_latency_ms": 2475.9512079763226,
+      "wall_seconds": 6.886699916998623,
+      "tokens_per_second": 223.0386133434754,
+      "p50_latency_ms": 2291.2629789934726,
+      "p95_latency_ms": 2307.231790997321,
       "ttft_ms": null
     },
     {
@@ -53,10 +53,10 @@
       "n_requests": 24,
       "tokens_per_request": 128,
       "total_tokens": 3072,
-      "wall_seconds": 8.754782625008374,
-      "tokens_per_second": 350.8939206811045,
-      "p50_latency_ms": 2898.407500004396,
-      "p95_latency_ms": 2967.0788329967763,
+      "wall_seconds": 7.781633707985748,
+      "tokens_per_second": 394.7757135943601,
+      "p50_latency_ms": 2592.2772089979844,
+      "p95_latency_ms": 2601.252124994062,
       "ttft_ms": null
     },
     {
@@ -66,10 +66,10 @@
       "n_requests": 48,
       "tokens_per_request": 128,
       "total_tokens": 6144,
-      "wall_seconds": 13.043940332980128,
-      "tokens_per_second": 471.02331375018565,
-      "p50_latency_ms": 4342.265500003123,
-      "p95_latency_ms": 4411.6398750047665,
+      "wall_seconds": 11.233331667026505,
+      "tokens_per_second": 546.9437013094383,
+      "p50_latency_ms": 3742.1223749988712,
+      "p95_latency_ms": 3747.585375007475,
       "ttft_ms": null
     },
     {
@@ -79,10 +79,10 @@
       "n_requests": 3,
       "tokens_per_request": 128,
       "total_tokens": 384,
-      "wall_seconds": 1.979782874986995,
-      "tokens_per_second": 193.9606634906984,
-      "p50_latency_ms": 664.4360829959624,
-      "p95_latency_ms": 708.5386249818839,
+      "wall_seconds": 2.0992455419909675,
+      "tokens_per_second": 182.92286077016342,
+      "p50_latency_ms": 688.0203339969739,
+      "p95_latency_ms": 729.7694590233732,
       "ttft_ms": null
     },
     {
@@ -92,10 +92,10 @@
       "n_requests": 12,
       "tokens_per_request": 128,
       "total_tokens": 1536,
-      "wall_seconds": 7.266304916003719,
-      "tokens_per_second": 211.3866700827579,
-      "p50_latency_ms": 2379.0127504908014,
-      "p95_latency_ms": 2498.939415992936,
+      "wall_seconds": 7.64193549999618,
+      "tokens_per_second": 200.99620050454075,
+      "p50_latency_ms": 2514.498624499538,
+      "p95_latency_ms": 2600.473082973622,
       "ttft_ms": null
     },
     {
@@ -105,10 +105,10 @@
       "n_requests": 24,
       "tokens_per_request": 128,
       "total_tokens": 3072,
-      "wall_seconds": 14.367913583992049,
-      "tokens_per_second": 213.8097492055253,
-      "p50_latency_ms": 4731.150541512761,
-      "p95_latency_ms": 4867.09279200295,
+      "wall_seconds": 15.538205416989513,
+      "tokens_per_second": 197.70622910166108,
+      "p50_latency_ms": 5022.403041512007,
+      "p95_latency_ms": 5350.780707987724,
       "ttft_ms": null
     },
     {
@@ -118,10 +118,10 @@
       "n_requests": 48,
       "tokens_per_request": 128,
       "total_tokens": 6144,
-      "wall_seconds": 28.704175209015375,
-      "tokens_per_second": 214.04551621014002,
-      "p50_latency_ms": 9486.88406200381,
-      "p95_latency_ms": 9616.916208004113,
+      "wall_seconds": 30.64444795800955,
+      "tokens_per_second": 200.49308796225648,
+      "p50_latency_ms": 10105.949478995171,
+      "p95_latency_ms": 10394.80370900128,
       "ttft_ms": null
     }
   ]
