@@ -174,6 +174,15 @@ python3 scripts/bench_compare.py \
     --tokens 200 --runs 3
 ```
 
+## Backends
+
+| Backend | Feature flag | When to use |
+|---|---|---|
+| **Candle** (default) | `--features candle-metal` | Default. Powers the paged engine, continuous batching, prefix cache. |
+| MLX (oxideai) | `--features mlx` | Experimental. Upstream `mlx-lm` has correctness bugs in decode. |
+| **mistral.rs** | `--features mistralrs` | Drop-in fallback for any HF text model. Bypasses our paged scheduler — use when you want zero-config model loading or to compare engines. Override at runtime: `VELOX_BACKEND=mistralrs velox serve …`. |
+| llama.cpp | `--features llamacpp` | Stub. Slated for non-Apple platforms. |
+
 ## Roadmap
 
 Single-stream perf (close the gap with mlx-lm):

@@ -70,6 +70,7 @@ mlx-lm-utils = { git = "https://github.com/oxideai/mlx-rs", branch = "main", opt
 
 # HuggingFace model download
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+mistralrs = { version = "0.8.1", features = ["metal"], optional = true }
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -81,6 +82,7 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 mlx = ["dep:mlx-rs", "dep:mlx-lm", "dep:mlx-lm-utils", "dep:tokenizers"]
 llamacpp = []
+mistralrs = ["dep:mistralrs"]
 
 [[bin]]
 name = "velox"
