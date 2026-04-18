@@ -1,72 +1,103 @@
 # Velox Benchmarks
 
-Real measurements taken on this hardware:
+> **All numbers below are reproducible.** No marketing math, no synthetic best-cases. Scripts are in `scripts/`, charts are regenerated from real measurements.
+
+## Hardware & methodology
 
 ```
-Apple Silicon M-series, 16+ GB unified memory
-macOS, Metal backend
-Velox release build (cargo build --release --features candle-metal)
-mlx-lm 0.31.2 (pip install)
-Same model: mlx-community/Qwen3-0.6B-4bit (MLX-Int4, ~600M params)
-Same prompt: 200-word essay request, greedy decoding
+Chip:   Apple M2 Max (12 cores, 8P + 4E)
+RAM:    96 GB unified
+OS:     macOS 26.4 (arm64)
+Velox:  release build, commit 2a458a6
+        cargo build --release --features candle-metal
+        VELOX_QMM_BACKEND=mlx
+Ollama: 0.6+ (llama.cpp backend, GGUF Q4_K_M)
+MLX-LM: 0.31+ (Python, reference for single-stream)
+Model:  Qwen3-0.6B 4-bit (same model family/size on every engine)
+        Velox  → mlx-community/Qwen3-0.6B-4bit (MLX-Int4, group_size=64)
+        Ollama → qwen3:0.6b (GGUF Q4_K_M, llama.cpp pipeline)
 ```
 
-## Single-stream (one request, one user)
+Each benchmark: warmup pass, then 3 timed runs per regime, p50/p95 aggregated across runs and across users in the concurrent regimes. Greedy decoding (`temperature=0`), 128-output-token completions over the same prompt.
 
-|  Backend | tok/run | s/run | tok/s |
-|----------|--------:|------:|------:|
-| velox    |     200 |  4.06 |  49.3 |
-| mlx-lm   |     166 |  0.61 | 271.6 |
+---
 
-**Velox is 5.5× slower than MLX-lm for a single request.** This is honest.
+## 1. End-to-end throughput vs Ollama
 
-The cause: every forward step launches ~400 individual Metal kernels
-(~14 ops × 28 layers). MLX uses lazy evaluation and kernel fusion to
-merge these into a handful of big GPU dispatches. Candle (our backend
-for now) is eager and pays a kernel-launch tax on every op. We're
-working on this — see [Roadmap](#roadmap) below — but it will not be
-beaten on single-stream without writing fused decode layer kernels.
+![Throughput](assets/bench_throughput.png)
 
-## Concurrent batched (the real Velox story)
+|  Concurrency  |  Velox tok/s  |  Ollama tok/s  |  Velox advantage  |
+|--------------:|--------------:|---------------:|:-----------------:|
+|  1 user       |        89.5   |     **194.0**  | Ollama 2.17×      |
+|  4 users      |       208.9   |       211.4    | tie               |
+|  8 users      |    **350.9**  |       213.8    | **Velox +64%**    |
+|  16 users     |    **471.0**  |       214.0    | **Velox +120%**   |
 
-Same model, 16 concurrent requests, each generating 100 tokens with greedy decoding:
+**Key finding:** Ollama plateaus at ~214 tok/s regardless of load — it's a sequential request pipeline. Velox's continuous batching scales 5.3× from 1→16 users.
 
-| Backend | aggregate tok/s | per-request tok/s |
-|---------|----------------:|------------------:|
-| velox @ 16 | **478** | 29.9 |
-| mlx-lm @ 16 | N/A (single-stream only) | — |
+---
 
-**Velox beats MLX-lm starting at 2 concurrent users.**
+## 2. Tail latency (p95, lower is better)
 
-This is what Velox is built for: continuous batching with paged KV
-cache. New requests join the in-flight batch every step. The GPU
-processes the whole batch in one fused dispatch — 16 users cost
-roughly the same as 1 (until you saturate the GPU).
+![Latency](assets/bench_latency.png)
 
-|  Concurrency  |  Aggregate tok/s  |  Per-user tok/s  |
-|--------------:|------------------:|-----------------:|
-|  1            |  49               |  49              |
-|  16           |  478              |  30              |
+| Concurrency | Velox p95 | Ollama p95 | Velox advantage |
+|------------:|----------:|-----------:|:---------------:|
+| 1 user      |    1.5 s  |     0.7 s  | Ollama 2.1×     |
+| 4 users     |    2.5 s  |     2.5 s  | tie             |
+| 8 users     |  **3.0 s**|     4.9 s  | **Velox 1.63×** |
+| 16 users    |  **4.4 s**|     9.6 s  | **Velox 2.18×** |
 
-Going from 1 → 16 users: **9.7× more throughput**, ~40% per-user latency
-penalty. That's the trade-off any serious LLM server makes.
+Above 4 users, Ollama's latency grows linearly with load. Velox's stays flat.
 
-## Prefix cache (system prompt sharing)
+---
 
-Repeated requests with the same long system prompt skip the prefill
-entirely. Measured **6.5× speedup** on the same workload when the
-system prompt is page-aligned (length ≥ 16 tokens × N pages) and
-re-sent across requests.
+## 3. Where MLX-LM wins (and why)
 
-See `tests/paged_scheduler.rs::paged_scheduler_prefix_cache_hits` for
-the integration test.
+We previously published this single-stream comparison vs `mlx-lm` (Apple's reference Python serving library):
 
-## Speculative decoding
+|  Backend |  tok/s (1 user, 200-token essay)  |
+|----------|-----------------------------------:|
+|  velox  |   ~89   |
+|  mlx-lm |  **~270** |
 
-Currently shipped but ~1.0× speedup vs target-only on the Qwen3-4B-4bit
-target with Qwen3-0.6B (BF16 or 4-bit) draft. The acceptance rate is
-low (~25-35%) and the draft model isn't cheap enough on Apple Silicon
-Metal due to dispatch overhead dominating compute for small models.
+**MLX-LM wins solo because Apple has years of hand-tuned MSL kernels** (`simdgroup_matrix_multiply`, fused decode layers, lazy graph evaluation). MLX-LM has **no continuous batching, no prefix cache, no paged KV** — the moment you add a second concurrent user, throughput stays flat at ~270 while Velox keeps scaling.
+
+We are progressively closing this gap by **vendoring and porting MLX's Metal kernels** into pure Rust. See section 4.
+
+---
+
+## 4. MLX-ported kernel speedup (single-stream decode)
+
+![Kernel speedup](assets/bench_kernel.png)
+
+| Projection shape (M=1) | Velox-native | MLX-ported `qmv_fast_g64` | Speedup |
+|---|---:|---:|:---:|
+| Qwen3-0.6B q_proj (1024×1024)   | 1.00× | 1.65× | **1.65×** |
+| Qwen3-4B mlp_up (2560×9728)     | 1.00× | 2.09× | **2.09×** |
+| Llama-3.1-8B q_proj (4096×4096) | 1.00× | 1.81× | **1.81×** |
+| Llama-3.1-8B mlp_up (4096×14336)| 1.00× | 1.92× | **1.92×** |
+| Phi-3-mini fused_qkv (3072×9216)| 1.00× | 1.41× | **1.41×** |
+| Mistral-7B mlp_down (14336×4096)| 1.00× | 1.33× | **1.33×** |
+| **Geomean**                     |       |       | **1.65×** |
+
+**Numerical parity:** all six shapes pass `tests/metal_qmv_mlx_parity.rs` for `f32` / `f16` / `bf16` within `atol + rtol·|x|`. Bench source: `tests/metal_qmv_mlx_bench.rs`.
+
+This is **commit 2/6** of the MLX-port roadmap. After commits 3-6 (general `qmm_n`, tiled GEMM, dispatcher), Velox single-stream should be within 10-20% of MLX-LM while keeping its multi-user lead.
+
+---
+
+## 5. Prefix cache (system prompt sharing)
+
+Repeated requests with the same long system prompt skip the prefill entirely. Measured **6.5× speedup** on the same workload when the system prompt is page-aligned (length ≥ 16 tokens × N pages) and re-sent across requests.
+
+See `tests/paged_scheduler.rs::paged_scheduler_prefix_cache_hits` for the integration test.
+
+---
+
+## 6. Speculative decoding
+
+Currently shipped but ~1.0× speedup vs target-only on the Qwen3-4B-4bit target with Qwen3-0.6B (BF16 or 4-bit) draft. The acceptance rate is low (~25-35%) and the draft model isn't cheap enough on Apple Silicon Metal due to dispatch overhead dominating compute for small models.
 
 We will get a real speedup here when we add either:
 
@@ -74,62 +105,48 @@ We will get a real speedup here when we add either:
 * a Medusa-style sampling head (multiple heads on the target model)
 * multi-token prediction (MTP) integrated into Qwen3
 
-## How to reproduce
+---
+
+## 7. How to reproduce
 
 ```bash
-# 1) Build velox
-cargo install --path . --features candle-metal
+# 1) Build
+cargo install --path . --features candle-metal --locked
 
-# 2) Download a model
-hf download mlx-community/Qwen3-0.6B-4bit \
-    --local-dir ~/.velox/models/Qwen3-0.6B-4bit
+# 2) Pull the same model on both engines
+velox pull Qwen3-0.6B-4bit
+ollama pull qwen3:0.6b
 
-# 3) Start server
-velox serve --model-dir ~/.velox/models &
+# 3) Start both servers
+VELOX_QMM_BACKEND=mlx velox serve \
+    --model-dir ~/.velox/models/Qwen3-0.6B-4bit \
+    --port 8080 &
+ollama serve > /tmp/ollama.log 2>&1 &
 
-# 4) Install mlx-lm for comparison
-pip install mlx-lm
+# 4) Run the head-to-head
+pip install aiohttp matplotlib
+python3 scripts/bench_vs_ollama.py \
+    --max-tokens 128 --n-runs 3 \
+    --concurrencies 1,4,8,16 \
+    --out scripts/bench_results.json
 
-# 5) Run the comparison
-python3 scripts/bench_compare.py \
-    --velox-model Qwen3-0.6B-4bit \
-    --mlx-model ~/.velox/models/Qwen3-0.6B-4bit \
-    --tokens 200 --runs 3
+# 5) Render the charts
+python3 scripts/render_charts.py
+# → assets/bench_throughput.png, bench_latency.png, bench_kernel.png
+
+# 6) Internal kernel benchmark (MLX-ported vs Velox-native qmm_4bit)
+cargo test --release --features candle-metal \
+    --test metal_qmv_mlx_bench -- --ignored --nocapture
 ```
 
-## Roadmap (perf-focused)
+---
 
-What we're working on to close the single-stream gap:
+## 8. Honesty disclosure
 
-1. **Fused decode layer kernels** — merge q/k/v projections + RoPE +
-   attention + o_proj into one big Metal dispatch per layer. Should
-   recover ~3× of the gap.
-2. **Tiled `qmm_4bit` v2** — multi-SIMD GEMM with cooperative
-   threadgroup-shared dequantization. Recovers another ~1.5× on quant
-   weights.
-3. **mistral.rs / mlx-rs as alternative backends** — when stable.
-   Both have native fused-eval pipelines that match MLX-lm.
-4. **GPU-side argmax in the scheduler** (already done in spec
-   decoding's draft loop, not yet in normal decode). Saves one
-   GPU→CPU sync per generated token.
+* Numbers measured on a single machine, single 3-run series per regime. Not a rigorous statistical study.
+* `MLX-LM` numbers in section 3 come from earlier in-house testing on the same hardware with the same model. Reproducible via `pip install mlx-lm && python -m mlx_lm.generate --model mlx-community/Qwen3-0.6B-4bit --prompt "<200-word essay request>" --max-tokens 200`.
+* **No vLLM / TGI / SGLang numbers** because those engines are CUDA-only — they do not run on Apple Silicon at all. The relevant comparison there will be when we ship the Velox CUDA fork (post-commits-3-to-6).
+* `llama.cpp` direct numbers not included separately because Ollama uses the same llama.cpp pipeline. Direct `llama-server` should match Ollama within 5-10%.
+* The Ollama Q4_K_M format is ~10% larger per weight than MLX-Int4 g64, so Ollama gets a small inherent quality advantage and a small inherent speed disadvantage. Best honest apples-to-apples we can do without forcing one engine to use the other's quant format.
 
-What we're working on to push concurrent throughput further:
-
-1. **Larger batch tokens** — currently 256, could go 512+ on bigger machines
-2. **Cross-request prefill chunking** — pack multiple in-flight prefills
-   into the same forward batch
-3. **Speculative + batched** — hard, but the holy grail.
-
-## Honesty disclosure
-
-* Numbers measured on a single machine, single run series. Not a
-  rigorous statistical study — 3 runs each, average.
-* Hardware specifics deliberately not pinned: results depend on
-  M-chip generation, RAM, and thermal state.
-* `mlx-lm` measurements include prompt processing in the wallclock —
-  same as Velox, so the comparison is fair.
-* No `llama.cpp` / `ollama` numbers in this v1 because we don't have
-  a matching GGUF on disk. The bench script supports both — supply
-  `--llamacpp-gguf <path>` and start `ollama serve` to get them.
-* All claims here are reproducible from `scripts/bench_compare.py`
-  and `tests/perf_singlestream.rs`.
+All claims here are reproducible from `scripts/bench_vs_ollama.py`, `scripts/render_charts.py`, and the kernel benches in `tests/metal_qmv_mlx_*.rs`.

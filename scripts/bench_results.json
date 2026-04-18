@@ -1,0 +1,128 @@
+{
+  "hardware": {
+    "os": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "chip": "Apple M2 Max",
+    "ram_gb": 96
+  },
+  "prompt": "Write a 200-word essay about why Apple Silicon is well-suited for LLM inference.",
+  "max_tokens": 128,
+  "results": [
+    {
+      "backend": "velox",
+      "regime": "ttft",
+      "concurrency": 1,
+      "n_requests": 3,
+      "tokens_per_request": 32,
+      "total_tokens": 0,
+      "wall_seconds": 0.0,
+      "tokens_per_second": 0.0,
+      "p50_latency_ms": 24.352417007321492,
+      "p95_latency_ms": 24.475958984112367,
+      "ttft_ms": 24.352417007321492
+    },
+    {
+      "backend": "velox",
+      "regime": "single_stream",
+      "concurrency": 1,
+      "n_requests": 3,
+      "tokens_per_request": 128,
+      "total_tokens": 384,
+      "wall_seconds": 4.291551540984074,
+      "tokens_per_second": 89.47812844208482,
+      "p50_latency_ms": 1435.5903329851571,
+      "p95_latency_ms": 1450.397749984404,
+      "ttft_ms": null
+    },
+    {
+      "backend": "velox",
+      "regime": "multi_stream",
+      "concurrency": 4,
+      "n_requests": 12,
+      "tokens_per_request": 128,
+      "total_tokens": 1536,
+      "wall_seconds": 7.352084540994838,
+      "tokens_per_second": 208.92033972614766,
+      "p50_latency_ms": 2463.661895992118,
+      "p95_latency_ms": 2475.9512079763226,
+      "ttft_ms": null
+    },
+    {
+      "backend": "velox",
+      "regime": "multi_stream",
+      "concurrency": 8,
+      "n_requests": 24,
+      "tokens_per_request": 128,
+      "total_tokens": 3072,
+      "wall_seconds": 8.754782625008374,
+      "tokens_per_second": 350.8939206811045,
+      "p50_latency_ms": 2898.407500004396,
+      "p95_latency_ms": 2967.0788329967763,
+      "ttft_ms": null
+    },
+    {
+      "backend": "velox",
+      "regime": "multi_stream",
+      "concurrency": 16,
+      "n_requests": 48,
+      "tokens_per_request": 128,
+      "total_tokens": 6144,
+      "wall_seconds": 13.043940332980128,
+      "tokens_per_second": 471.02331375018565,
+      "p50_latency_ms": 4342.265500003123,
+      "p95_latency_ms": 4411.6398750047665,
+      "ttft_ms": null
+    },
+    {
+      "backend": "ollama",
+      "regime": "single_stream",
+      "concurrency": 1,
+      "n_requests": 3,
+      "tokens_per_request": 128,
+      "total_tokens": 384,
+      "wall_seconds": 1.979782874986995,
+      "tokens_per_second": 193.9606634906984,
+      "p50_latency_ms": 664.4360829959624,
+      "p95_latency_ms": 708.5386249818839,
+      "ttft_ms": null
+    },
+    {
+      "backend": "ollama",
+      "regime": "multi_stream",
+      "concurrency": 4,
+      "n_requests": 12,
+      "tokens_per_request": 128,
+      "total_tokens": 1536,
+      "wall_seconds": 7.266304916003719,
+      "tokens_per_second": 211.3866700827579,
+      "p50_latency_ms": 2379.0127504908014,
+      "p95_latency_ms": 2498.939415992936,
+      "ttft_ms": null
+    },
+    {
+      "backend": "ollama",
+      "regime": "multi_stream",
+      "concurrency": 8,
+      "n_requests": 24,
+      "tokens_per_request": 128,
+      "total_tokens": 3072,
+      "wall_seconds": 14.367913583992049,
+      "tokens_per_second": 213.8097492055253,
+      "p50_latency_ms": 4731.150541512761,
+      "p95_latency_ms": 4867.09279200295,
+      "ttft_ms": null
+    },
+    {
+      "backend": "ollama",
+      "regime": "multi_stream",
+      "concurrency": 16,
+      "n_requests": 48,
+      "tokens_per_request": 128,
+      "total_tokens": 6144,
+      "wall_seconds": 28.704175209015375,
+      "tokens_per_second": 214.04551621014002,
+      "p50_latency_ms": 9486.88406200381,
+      "p95_latency_ms": 9616.916208004113,
+      "ttft_ms": null
+    }
+  ]
+}
