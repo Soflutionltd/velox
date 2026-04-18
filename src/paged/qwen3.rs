@@ -22,7 +22,7 @@ use candle_nn::{linear_b, linear_no_bias, rms_norm, Activation, Embedding, Linea
 use std::sync::Arc;
 
 #[cfg(all(target_os = "macos", feature = "candle-metal"))]
-use super::metal_kernels::ScatterSlot;
+use super::metal_kernels::{paged_decode_attention, ScatterSlot};
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Qwen3Config {
@@ -231,6 +231,26 @@ impl PagedQwen3Attention {
         let k_all = k_all.reshape((total, self.num_kv_heads, self.head_dim))?;
         let v_all = v_all.reshape((total, self.num_kv_heads, self.head_dim))?;
 
+        // ---- Fused decode fast path -------------------------------------
+        //
+        // When every sequence in the batch contributes exactly one new
+        // token (the steady-state case under continuous batching), we can
+        // collapse the per-seq attention loop — gather K, gather V,
+        // matmul Q·Kᵀ, softmax, matmul ·V — into one fused Metal kernel.
+        // This eliminates O(N · num_layers · ~5) GPU dispatches per step.
+        #[cfg(all(target_os = "macos", feature = "candle-metal"))]
+        {
+            let pure_decode = !seqs.is_empty()
+                && seqs.iter().all(|s| s.new_tokens == 1)
+                && matches!(x.device(), Device::Metal(_))
+                && self.head_dim <= 256
+                && self.head_dim % 32 == 0;
+            if pure_decode {
+                return self.forward_decode_fused(&q_all, &k_all, &v_all, seqs, pages);
+            }
+        }
+        // -----------------------------------------------------------------
+
         // 3. Per-request: apply RoPE at the right offset, write new K/V into
         //    the page pool, gather full K/V history, then SDPA.
         //
@@ -301,6 +321,129 @@ impl PagedQwen3Attention {
         Tensor::cat(&outputs, 0).context("concat attention outputs").map_err(Into::into)
     }
 
+    /// Fused-decode fast path. Pre-conditions checked by caller:
+    ///   * every seq has `new_tokens == 1`
+    ///   * device is Metal
+    ///   * head_dim is 32-aligned and ≤ 256
+    ///
+    /// Inputs:
+    ///   q_all : [N, H_q,  D]   (post-RMSNorm, pre-RoPE)
+    ///   k_all : [N, H_kv, D]   (post-RMSNorm, pre-RoPE)
+    ///   v_all : [N, H_kv, D]   (no norm, no RoPE)
+    ///
+    /// We:
+    ///   1) Apply RoPE to Q and K per-seq at their kv_offset (cheap, single
+    ///      token each), accumulate into a packed [N, H_q, D] / [N, H_kv, D].
+    ///   2) Scatter the new K and V into the layer pool (one inplace_op2
+    ///      per seq × (K|V), uses our custom MSL scatter kernel).
+    ///   3) Build block_table [N, MB] u32 and kv_lens [N] u32 tensors.
+    ///   4) Call paged_decode_attention → [N, H_q, D].
+    ///   5) o_proj.
+    #[cfg(all(target_os = "macos", feature = "candle-metal"))]
+    fn forward_decode_fused(
+        &self,
+        q_all: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        seqs: &[SeqSlice<'_>],
+        pages: &PagedKvCache,
+    ) -> Result<Tensor> {
+        let n = seqs.len();
+        let h_q = self.num_heads;
+        let h_kv = self.num_kv_heads;
+        let d = self.head_dim;
+        let device = q_all.device();
+        let dtype = q_all.dtype();
+
+        // 1) Per-seq RoPE then accumulate into packed buffers.
+        //    We collect q_rot rows and k_rot rows then cat once, then scatter.
+        let mut q_rows: Vec<Tensor> = Vec::with_capacity(n);
+        let mut k_rows: Vec<Tensor> = Vec::with_capacity(n);
+        let mut v_rows: Vec<Tensor> = Vec::with_capacity(n);
+
+        for (i, seq) in seqs.iter().enumerate() {
+            // Slice the i-th token from the packed batch.
+            let q_i = q_all.narrow(0, i, 1)?; // [1, H_q,  D]
+            let k_i = k_all.narrow(0, i, 1)?; // [1, H_kv, D]
+            let v_i = v_all.narrow(0, i, 1)?;
+
+            // RoPE wants [H, L=1, D]. transpose(0,1) flips the leading
+            // batch and head dims, giving [H, 1, D] directly (NO squeeze).
+            let q_for_rope = q_i.transpose(0, 1)?.contiguous()?; // [H_q, 1, D]
+            let k_for_rope = k_i.transpose(0, 1)?.contiguous()?; // [H_kv, 1, D]
+            let (q_rot, k_rot) = self
+                .rotary
+                .apply_at_offset(&q_for_rope, &k_for_rope, seq.kv_offset)?;
+            // Back to [1, H, D]
+            let q_rot = q_rot.transpose(0, 1)?.contiguous()?; // [1, H_q, D]
+            let k_rot = k_rot.transpose(0, 1)?.contiguous()?; // [1, H_kv, D]
+
+            q_rows.push(q_rot);
+            k_rows.push(k_rot);
+            v_rows.push(v_i);
+        }
+
+        let q_packed = Tensor::cat(&q_rows, 0)?.contiguous()?; // [N, H_q,  D]
+        let k_packed = Tensor::cat(&k_rows, 0)?.contiguous()?; // [N, H_kv, D]
+        let v_packed = Tensor::cat(&v_rows, 0)?.contiguous()?; // [N, H_kv, D]
+
+        // 2) Scatter the new K/V into the layer pool, one slot per seq.
+        let k_pool = pages.layer_k_pool(self.layer_idx);
+        let v_pool = pages.layer_v_pool(self.layer_idx);
+        let page_size = pages.page_size();
+
+        for (i, seq) in seqs.iter().enumerate() {
+            let logical_pos = seq.kv_offset; // n_new=1, write at kv_offset
+            let page_block = logical_pos / page_size;
+            let slot = (logical_pos % page_size) as u32;
+            let page_id = *seq.block_table.get(page_block).ok_or_else(|| {
+                anyhow!(
+                    "fused decode: block_table too short: pos={} needs block {}, have {}",
+                    logical_pos,
+                    page_block,
+                    seq.block_table.len()
+                )
+            })?;
+
+            let k_t = k_packed.narrow(0, i, 1)?.squeeze(0)?; // [H_kv, D]
+            let v_t = v_packed.narrow(0, i, 1)?.squeeze(0)?;
+            scatter_into_pool(k_pool, &k_t, page_id, slot)?;
+            scatter_into_pool(v_pool, &v_t, page_id, slot)?;
+        }
+
+        // 3) Build block_table and kv_lens tensors.
+        //    kv_lens[i] = kv_offset[i] + 1  (the new token is now in the pool).
+        let max_blocks = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(1);
+        let mut bt = vec![0u32; n * max_blocks];
+        for (i, seq) in seqs.iter().enumerate() {
+            for (j, b) in seq.block_table.iter().enumerate() {
+                bt[i * max_blocks + j] = *b;
+            }
+        }
+        let block_table = Tensor::from_vec(bt, (n, max_blocks), device)?;
+        let kv_lens: Vec<u32> = seqs.iter().map(|s| (s.kv_offset + 1) as u32).collect();
+        let kv_lens_t = Tensor::from_vec(kv_lens, n, device)?;
+
+        // 4) Fused attention.
+        let scale = 1.0 / (d as f32).sqrt();
+        let attn_out = paged_decode_attention(
+            &q_packed,
+            k_pool,
+            v_pool,
+            &block_table,
+            &kv_lens_t,
+            scale,
+        )?; // [N, H_q, D]
+
+        // 5) o_proj. Reshape [N, H_q, D] → [N, H_q*D] = [N, hidden].
+        let attn_out = attn_out
+            .reshape((n, h_q * d))?
+            .to_dtype(dtype)?;
+        let _ = h_kv;
+        let out = self.o_proj.forward(&attn_out)?;
+        Ok(out)
+    }
+
     /// Write K/V for the `new_tokens` newly-arrived positions into the
     /// per-page pool at this request's logical offset.
     ///
@@ -321,8 +464,8 @@ impl PagedQwen3Attention {
         let page_size = pages.page_size();
         let kv_offset = seq.kv_offset;
 
-        let mut k_guard = pages.lock_layer_k_pages(self.layer_idx);
-        let mut v_guard = pages.lock_layer_v_pages(self.layer_idx);
+        let k_pool = pages.layer_k_pool(self.layer_idx);
+        let v_pool = pages.layer_v_pool(self.layer_idx);
 
         for t in 0..n_new {
             let logical_pos = kv_offset + t;
@@ -335,13 +478,13 @@ impl PagedQwen3Attention {
                     page_block,
                     seq.block_table.len()
                 )
-            })? as usize;
+            })? as u32;
 
             let k_t = k.narrow(1, t, 1)?.squeeze(1)?; // [H_kv, D]
             let v_t = v.narrow(1, t, 1)?.squeeze(1)?;
 
-            scatter_into_page(&mut k_guard[page_id], &k_t, slot)?;
-            scatter_into_page(&mut v_guard[page_id], &v_t, slot)?;
+            scatter_into_pool(k_pool, &k_t, page_id, slot as u32)?;
+            scatter_into_pool(v_pool, &v_t, page_id, slot as u32)?;
         }
 
         Ok(())
@@ -359,26 +502,35 @@ impl PagedQwen3Attention {
         seq: &SeqSlice<'_>,
         total_kv: usize,
         _dtype: DType,
-        _device: &Device,
+        device: &Device,
         pages: &PagedKvCache,
     ) -> Result<(Tensor, Tensor)> {
         let page_size = pages.page_size();
+        let num_kv_heads = pages.num_kv_heads();
+        let head_dim = pages.head_dim();
         let n_pages_needed = total_kv.div_ceil(page_size);
 
-        let k_guard = pages.lock_layer_k_pages(self.layer_idx);
-        let v_guard = pages.lock_layer_v_pages(self.layer_idx);
-        let k_pages: Vec<Tensor> = (0..n_pages_needed)
-            .map(|i| k_guard[seq.block_table[i] as usize].clone())
-            .collect();
-        let v_pages: Vec<Tensor> = (0..n_pages_needed)
-            .map(|i| v_guard[seq.block_table[i] as usize].clone())
-            .collect();
-        drop(k_guard);
-        drop(v_guard);
+        let block_ids: Vec<u32> = seq.block_table[..n_pages_needed].to_vec();
+        let idx = Tensor::from_vec(block_ids, n_pages_needed, device)?;
 
-        // Each page: [H_kv, page_size, D]. Cat along dim 1 → [H_kv, n_pages_needed*page_size, D].
-        let k = Tensor::cat(&k_pages, 1)?.narrow(1, 0, total_kv)?.contiguous()?;
-        let v = Tensor::cat(&v_pages, 1)?.narrow(1, 0, total_kv)?.contiguous()?;
+        let k_pool = pages.layer_k_pool(self.layer_idx); // [P, H_kv, S, D]
+        let v_pool = pages.layer_v_pool(self.layer_idx);
+
+        // index_select on dim 0: [n_pages, H_kv, S, D]
+        let k = k_pool
+            .index_select(&idx, 0)?
+            .transpose(0, 1)? // [H_kv, n_pages, S, D]
+            .contiguous()?
+            .reshape((num_kv_heads, n_pages_needed * page_size, head_dim))?
+            .narrow(1, 0, total_kv)?
+            .contiguous()?;
+        let v = v_pool
+            .index_select(&idx, 0)?
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((num_kv_heads, n_pages_needed * page_size, head_dim))?
+            .narrow(1, 0, total_kv)?
+            .contiguous()?;
 
         Ok((k, v))
     }
@@ -416,46 +568,27 @@ fn build_causal_mask(
         .map_err(Into::into)
 }
 
-/// Replace one `[H_kv, D]` slot inside a `[H_kv, page_size, D]` page,
-/// in place when running on Metal (custom MSL kernel, O(H_kv * D) work,
-/// no allocation), or via a `cat(pre, mid, post)` fallback elsewhere.
-///
-/// `value` does NOT need to be contiguous; we'll make it contiguous
-/// before handing it to the kernel.
-fn scatter_into_page(page: &mut Tensor, value: &Tensor, slot: usize) -> Result<()> {
-    let (h, s, d) = page.dims3()?;
-    debug_assert!(slot < s);
+/// Write a single `[H_kv, D]` slot into the layer KV pool
+/// `[P, H_kv, S, D]` at `(page_id, slot)`, in place when on Metal
+/// (custom MSL kernel) or via a slow CPU loop fallback.
+fn scatter_into_pool(pool: &Tensor, value: &Tensor, page_id: u32, slot: u32) -> Result<()> {
+    let (_p, h, s, d) = pool.dims4()?;
+    debug_assert!((slot as usize) < s);
     debug_assert_eq!(value.dims2()?, (h, d));
 
     #[cfg(all(target_os = "macos", feature = "candle-metal"))]
     {
-        if matches!(page.device(), Device::Metal(_)) {
+        if matches!(pool.device(), Device::Metal(_)) {
             let value = value.contiguous()?;
-            page.inplace_op2(
-                &value,
-                &ScatterSlot {
-                    slot: slot as u32,
-                },
-            )?;
+            pool.inplace_op2(&value, &ScatterSlot { page_id, slot })?;
             return Ok(());
         }
     }
 
-    let middle = value.reshape((h, 1, d))?;
-    let new_page = if s == 1 {
-        middle
-    } else {
-        let mut parts: Vec<Tensor> = Vec::with_capacity(3);
-        if slot > 0 {
-            parts.push(page.narrow(1, 0, slot)?);
-        }
-        parts.push(middle);
-        if slot + 1 < s {
-            parts.push(page.narrow(1, slot + 1, s - slot - 1)?);
-        }
-        Tensor::cat(&parts, 1)?
-    };
-    *page = new_page;
+    // CPU fallback: route through the same InplaceOp2, which handles
+    // arbitrary value strides via the layout. This keeps tests honest.
+    let value = value.contiguous()?;
+    pool.inplace_op2(&value, &ScatterSlot { page_id, slot })?;
     Ok(())
 }
 

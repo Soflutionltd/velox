@@ -19,6 +19,13 @@ use candle_core::{DType, Device, Tensor};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+// Mutex is still used for the free-list. The per-layer pools no longer
+// need a Mutex because Candle's Tensor storage already serialises
+// concurrent access via an internal RwLock, and the scheduler only ever
+// runs one forward pass at a time anyway.
+#[allow(unused_imports)]
+use std::marker::PhantomData;
+
 /// Static configuration of the paged KV pool. Once a [`PagedKvCache`] is
 /// built it cannot grow.
 #[derive(Debug, Clone)]
@@ -51,14 +58,18 @@ impl PagedKvConfig {
     }
 }
 
-/// One layer's K and V storage. We keep ONE Tensor per physical page
-/// (shape `[num_kv_heads, page_size, head_dim]`) instead of a single big
-/// `[num_pages, ...]` tensor: this turns each scatter from O(num_pages) to
-/// O(page_size). All pages are pre-allocated as `Tensor::zeros` once, and
-/// scatter replaces just the slot inside one page tensor.
+/// One layer's K and V storage. We allocate ONE big tensor per (layer, K|V)
+/// of shape `[num_pages, num_kv_heads, page_size, head_dim]`. This gives
+/// us:
+///   * a single Metal buffer per layer that the fused attention kernel
+///     can address by `page_id`,
+///   * O(H*D) scatter via a custom MSL kernel that writes a single slot
+///     in place (kernel computes the page offset internally), and
+///   * O(n_pages) gather via `index_select` along dim 0 — far cheaper
+///     than concatenating per-page tensors.
 struct LayerPool {
-    k_pages: Mutex<Vec<Tensor>>,
-    v_pages: Mutex<Vec<Tensor>>,
+    k_pool: Tensor,
+    v_pool: Tensor,
 }
 
 /// The full paged KV cache: one [`LayerPool`] per transformer layer, plus a
@@ -80,25 +91,14 @@ impl PagedKvCache {
             return Err(anyhow!("num_pages exceeds u32 range"));
         }
 
-        let page_shape = (cfg.num_kv_heads, cfg.page_size, cfg.head_dim);
+        let pool_shape = (cfg.num_pages, cfg.num_kv_heads, cfg.page_size, cfg.head_dim);
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for layer_idx in 0..cfg.num_layers {
-            let mut k_pages = Vec::with_capacity(cfg.num_pages);
-            let mut v_pages = Vec::with_capacity(cfg.num_pages);
-            for _ in 0..cfg.num_pages {
-                k_pages.push(
-                    Tensor::zeros(page_shape, cfg.dtype, device)
-                        .map_err(|e| anyhow!("alloc K page layer {layer_idx}: {e}"))?,
-                );
-                v_pages.push(
-                    Tensor::zeros(page_shape, cfg.dtype, device)
-                        .map_err(|e| anyhow!("alloc V page layer {layer_idx}: {e}"))?,
-                );
-            }
-            layers.push(LayerPool {
-                k_pages: Mutex::new(k_pages),
-                v_pages: Mutex::new(v_pages),
-            });
+            let k_pool = Tensor::zeros(pool_shape, cfg.dtype, device)
+                .map_err(|e| anyhow!("alloc K pool layer {layer_idx}: {e}"))?;
+            let v_pool = Tensor::zeros(pool_shape, cfg.dtype, device)
+                .map_err(|e| anyhow!("alloc V pool layer {layer_idx}: {e}"))?;
+            layers.push(LayerPool { k_pool, v_pool });
         }
 
         // Free list: all pages start free, pushed in reverse so page 0 is
@@ -193,15 +193,16 @@ impl PagedKvCache {
         }
     }
 
-    /// Lock per-page K storage for a layer. The returned guard is a
-    /// `Vec<Tensor>` of length `num_pages`. To scatter, replace one entry.
-    /// To gather, clone a few entries and `cat` them.
-    pub fn lock_layer_k_pages(&self, layer: usize) -> parking_lot::MutexGuard<'_, Vec<Tensor>> {
-        self.layers[layer].k_pages.lock()
+    /// The full K pool for a layer, shape `[num_pages, num_kv_heads,
+    /// page_size, head_dim]`. Scatter via `inplace_op2` with a
+    /// `ScatterSlot { page_id, slot }`; gather via `index_select` (slow
+    /// path) or by passing the buffer + a block table to a fused kernel.
+    pub fn layer_k_pool(&self, layer: usize) -> &Tensor {
+        &self.layers[layer].k_pool
     }
 
-    pub fn lock_layer_v_pages(&self, layer: usize) -> parking_lot::MutexGuard<'_, Vec<Tensor>> {
-        self.layers[layer].v_pages.lock()
+    pub fn layer_v_pool(&self, layer: usize) -> &Tensor {
+        &self.layers[layer].v_pool
     }
 }
 
