@@ -1,6 +1,7 @@
 // Inference backend trait: common interface for MLX and llama.cpp
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use std::path::Path;
 
 /// Handle to a loaded model
@@ -52,6 +53,23 @@ pub struct PrefillResult {
     pub time_ms: f64,
 }
 
+/// One event emitted by an in-flight streaming generation.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// A newly sampled token, plus its incremental decoded text (the diff).
+    /// `text_delta` may be empty for tokens that don't produce visible bytes
+    /// yet (typical for multi-byte UTF-8 sequences mid-encoding).
+    Token { token_id: u32, text_delta: String },
+    /// Generation finished cleanly. Includes final usage accounting.
+    Done {
+        finish_reason: String,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
+    /// Fatal error mid-stream.
+    Error(String),
+}
+
 #[async_trait]
 pub trait InferenceBackend: Send + Sync {
     /// Load a model from disk
@@ -62,6 +80,29 @@ pub trait InferenceBackend: Send + Sync {
 
     /// Generate tokens (non-streaming)
     async fn generate(&self, handle: &ModelHandle, request: &GenerateRequest) -> anyhow::Result<GenerateResult>;
+
+    /// Generate tokens as a stream of chunks. Default implementation runs the
+    /// non-streaming generator and emits the whole result as one chunk; backends
+    /// that support real per-token streaming should override.
+    async fn generate_stream(
+        &self,
+        handle: &ModelHandle,
+        request: &GenerateRequest,
+    ) -> anyhow::Result<BoxStream<'static, StreamChunk>> {
+        let result = self.generate(handle, request).await?;
+        let chunks = vec![
+            StreamChunk::Token {
+                token_id: 0,
+                text_delta: result.text,
+            },
+            StreamChunk::Done {
+                finish_reason: result.finish_reason,
+                prompt_tokens: result.prompt_tokens,
+                completion_tokens: result.completion_tokens,
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
 
     /// Prefill: process prompt tokens and populate KV cache
     async fn prefill(&self, handle: &ModelHandle, tokens: &[u32]) -> anyhow::Result<PrefillResult>;

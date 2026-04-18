@@ -16,24 +16,66 @@ use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
+use candle_transformers::models::mistral::{Config as MistralConfig, Model as MistralModel};
+use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3ForCausalLM};
 use dashmap::DashMap;
+use futures::stream::BoxStream;
 use minijinja::{context, Environment};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
-/// One loaded model. Variants per supported architecture.
-enum LoadedCandleModel {
-    Qwen3 {
-        model: Mutex<Qwen3ForCausalLM>,
-        tokenizer: Tokenizer,
-        chat_template: String,
-        eos_token_ids: Vec<u32>,
-        device: Device,
-        dtype: DType,
-    },
+/// All supported Candle architectures share the same forward signature
+/// (`forward(&mut self, tokens, seqlen_offset)` + `clear_kv_cache`). Wrap them
+/// in this enum to keep the per-token loop architecture-agnostic.
+enum CandleArch {
+    Qwen3(Qwen3ForCausalLM),
+    Mistral(MistralModel),
+    Phi3(Phi3Model),
+    Gemma3(Gemma3Model),
+}
+
+impl CandleArch {
+    fn forward(&mut self, tokens: &Tensor, offset: usize) -> candle_core::Result<Tensor> {
+        match self {
+            CandleArch::Qwen3(m) => m.forward(tokens, offset),
+            CandleArch::Mistral(m) => m.forward(tokens, offset),
+            CandleArch::Phi3(m) => m.forward(tokens, offset),
+            CandleArch::Gemma3(m) => m.forward(tokens, offset),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            CandleArch::Qwen3(m) => m.clear_kv_cache(),
+            CandleArch::Mistral(m) => m.clear_kv_cache(),
+            CandleArch::Phi3(m) => m.clear_kv_cache(),
+            CandleArch::Gemma3(m) => m.clear_kv_cache(),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            CandleArch::Qwen3(_) => "qwen3",
+            CandleArch::Mistral(_) => "mistral",
+            CandleArch::Phi3(_) => "phi3",
+            CandleArch::Gemma3(_) => "gemma3",
+        }
+    }
+}
+
+/// One loaded model with everything the inference loop needs.
+struct LoadedCandleModel {
+    model: Mutex<CandleArch>,
+    tokenizer: Tokenizer,
+    chat_template: String,
+    eos_token_ids: Vec<u32>,
+    device: Device,
+    #[allow(dead_code)]
+    dtype: DType,
 }
 
 pub struct CandleBackend {
@@ -87,36 +129,62 @@ impl InferenceBackend for CandleBackend {
             let eos_token_ids = read_eos_tokens(&path_buf, &tokenizer);
             let dtype = pick_dtype(&path_buf, &device);
 
-            let loaded = match arch.as_str() {
+            let shards = discover_safetensors(&path_buf)?;
+            tracing::info!(
+                "Loading {} safetensors shard(s), dtype={:?}",
+                shards.len(),
+                dtype
+            );
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)
+                    .map_err(|e| anyhow::anyhow!("VarBuilder failed: {e}"))?
+            };
+
+            let candle_arch = match arch.as_str() {
                 "qwen3" => {
-                    let cfg = load_qwen3_config(&path_buf)?;
-                    let shards = discover_safetensors(&path_buf)?;
-                    tracing::info!(
-                        "Loading {} safetensors shard(s), dtype={:?}",
-                        shards.len(),
-                        dtype
-                    );
-                    let vb = unsafe {
-                        VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)
-                            .map_err(|e| anyhow::anyhow!("VarBuilder failed: {e}"))?
-                    };
-                    let model = Qwen3ForCausalLM::new(&cfg, vb)
-                        .map_err(|e| anyhow::anyhow!("Qwen3ForCausalLM::new failed: {e}"))?;
-                    LoadedCandleModel::Qwen3 {
-                        model: Mutex::new(model),
-                        tokenizer,
-                        chat_template,
-                        eos_token_ids,
-                        device: device.clone(),
-                        dtype,
-                    }
+                    let cfg = load_arch_config::<Qwen3Config>(&path_buf)?;
+                    CandleArch::Qwen3(
+                        Qwen3ForCausalLM::new(&cfg, vb)
+                            .map_err(|e| anyhow::anyhow!("Qwen3ForCausalLM::new failed: {e}"))?,
+                    )
+                }
+                "mistral" => {
+                    let cfg = load_arch_config::<MistralConfig>(&path_buf)?;
+                    CandleArch::Mistral(
+                        MistralModel::new(&cfg, vb)
+                            .map_err(|e| anyhow::anyhow!("MistralModel::new failed: {e}"))?,
+                    )
+                }
+                "phi3" | "phi-3" => {
+                    let cfg = load_arch_config::<Phi3Config>(&path_buf)?;
+                    CandleArch::Phi3(
+                        Phi3Model::new(&cfg, vb)
+                            .map_err(|e| anyhow::anyhow!("Phi3Model::new failed: {e}"))?,
+                    )
+                }
+                "gemma3" | "gemma3_text" => {
+                    let cfg = load_arch_config::<Gemma3Config>(&path_buf)?;
+                    CandleArch::Gemma3(
+                        Gemma3Model::new(false, &cfg, vb)
+                            .map_err(|e| anyhow::anyhow!("Gemma3Model::new failed: {e}"))?,
+                    )
                 }
                 other => {
                     anyhow::bail!(
-                        "Architecture '{}' not yet supported by Candle backend. Supported: qwen3",
+                        "Architecture '{}' not yet supported by Candle backend. \
+                         Supported: qwen3, mistral, phi3, gemma3",
                         other
                     );
                 }
+            };
+
+            let loaded = LoadedCandleModel {
+                model: Mutex::new(candle_arch),
+                tokenizer,
+                chat_template,
+                eos_token_ids,
+                device: device.clone(),
+                dtype,
             };
 
             let id = uuid::Uuid::new_v4().to_string();
@@ -156,114 +224,103 @@ impl InferenceBackend for CandleBackend {
         let max_tokens = request.max_tokens.max(1) as usize;
         let temperature = request.temperature.max(0.0) as f64;
         let top_p = request.top_p.max(0.0).min(1.0) as f64;
+        let stop_sequences = request.stop_sequences.clone();
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<GenerateResult> {
-            match &*model_arc {
-                LoadedCandleModel::Qwen3 {
-                    model,
-                    tokenizer,
-                    chat_template,
-                    eos_token_ids,
-                    device,
-                    ..
-                } => {
-                    let prompt_ids: Vec<u32> = if !messages.is_empty() {
-                        let prompt_text = render_chat_template(chat_template, &messages)?;
-                        tokenizer
-                            .encode(prompt_text, true)
-                            .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?
-                            .get_ids()
-                            .to_vec()
-                    } else {
-                        prompt_tokens_pre
-                    };
+            let mut full_text = String::new();
+            let mut completion_tokens: u32 = 0;
+            let mut prompt_tokens: u32 = 0;
+            let mut finish_reason = String::from("length");
+            let mut all_tokens: Vec<u32> = Vec::new();
 
-                    if prompt_ids.is_empty() {
-                        anyhow::bail!("Empty prompt: provide either messages or prompt_tokens");
-                    }
-
-                    let prompt_token_count = prompt_ids.len() as u32;
-
-                    let mut model_guard = model.lock();
-                    model_guard.clear_kv_cache();
-
-                    let mut sampler = if temperature <= 1e-7 {
-                        LogitsProcessor::from_sampling(rand::random(), Sampling::ArgMax)
-                    } else if top_p <= 0.0 || top_p >= 1.0 {
-                        LogitsProcessor::from_sampling(
-                            rand::random(),
-                            Sampling::All { temperature },
-                        )
-                    } else {
-                        LogitsProcessor::from_sampling(
-                            rand::random(),
-                            Sampling::TopP { p: top_p, temperature },
-                        )
-                    };
-
-                    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-                    let mut finish_reason = String::from("length");
-
-                    // Prefill: feed the entire prompt in one shot, offset = 0.
-                    let prompt_tensor = Tensor::new(prompt_ids.as_slice(), device)
-                        .map_err(|e| anyhow::anyhow!("Prompt tensor build failed: {e}"))?
-                        .unsqueeze(0)
-                        .map_err(|e| anyhow::anyhow!("Prompt tensor unsqueeze failed: {e}"))?;
-                    let logits = model_guard
-                        .forward(&prompt_tensor, 0)
-                        .map_err(|e| anyhow::anyhow!("Prefill forward failed: {e}"))?;
-                    let logits = squeeze_to_1d(&logits)?;
-                    let next = sampler
-                        .sample(&logits)
-                        .map_err(|e| anyhow::anyhow!("Sampler failed: {e}"))?;
-
-                    let mut offset = prompt_ids.len();
-                    if eos_token_ids.contains(&next) {
-                        finish_reason = "stop".into();
-                    } else {
-                        generated.push(next);
-                    }
-
-                    // Decode loop: one token at a time.
-                    while generated.len() < max_tokens && finish_reason == "length" {
-                        let last = *generated.last().unwrap();
-                        let input = Tensor::new(&[last], device)
-                            .map_err(|e| anyhow::anyhow!("Decode tensor build failed: {e}"))?
-                            .unsqueeze(0)
-                            .map_err(|e| anyhow::anyhow!("Decode unsqueeze failed: {e}"))?;
-                        let logits = model_guard
-                            .forward(&input, offset)
-                            .map_err(|e| anyhow::anyhow!("Decode forward failed: {e}"))?;
-                        let logits = squeeze_to_1d(&logits)?;
-                        let next = sampler
-                            .sample(&logits)
-                            .map_err(|e| anyhow::anyhow!("Sampler failed: {e}"))?;
-                        offset += 1;
-
-                        if eos_token_ids.contains(&next) {
-                            finish_reason = "stop".into();
-                            break;
+            run_qwen3_inference(
+                &model_arc,
+                &messages,
+                &prompt_tokens_pre,
+                max_tokens,
+                temperature,
+                top_p,
+                &stop_sequences,
+                |chunk| -> bool {
+                    match chunk {
+                        StreamChunk::Token { token_id, text_delta } => {
+                            all_tokens.push(token_id);
+                            full_text.push_str(&text_delta);
+                            true
                         }
-                        generated.push(next);
+                        StreamChunk::Done {
+                            finish_reason: r,
+                            prompt_tokens: pt,
+                            completion_tokens: ct,
+                        } => {
+                            finish_reason = r;
+                            prompt_tokens = pt;
+                            completion_tokens = ct;
+                            true
+                        }
+                        StreamChunk::Error(_) => false,
                     }
+                },
+            )?;
 
-                    let text = tokenizer
-                        .decode(&generated, true)
-                        .map_err(|e| anyhow::anyhow!("Decode failed: {e}"))?;
-
-                    Ok(GenerateResult {
-                        completion_tokens: generated.len() as u32,
-                        tokens: generated,
-                        text,
-                        finish_reason,
-                        prompt_tokens: prompt_token_count,
-                    })
-                }
-            }
+            Ok(GenerateResult {
+                tokens: all_tokens,
+                text: full_text,
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+            })
         })
         .await??;
 
         Ok(result)
+    }
+
+    async fn generate_stream(
+        &self,
+        handle: &ModelHandle,
+        request: &GenerateRequest,
+    ) -> anyhow::Result<BoxStream<'static, StreamChunk>> {
+        let model_arc = self
+            .loaded
+            .get(&handle.id)
+            .map(|r| r.clone())
+            .ok_or_else(|| anyhow::anyhow!("Model {} not loaded in Candle backend", handle.id))?;
+
+        let messages = request.messages.clone();
+        let prompt_tokens_pre = request.prompt_tokens.clone();
+        let max_tokens = request.max_tokens.max(1) as usize;
+        let temperature = request.temperature.max(0.0) as f64;
+        let top_p = request.top_p.max(0.0).min(1.0) as f64;
+        let stop_sequences = request.stop_sequences.clone();
+
+        // Bounded channel: backpressure if the SSE consumer is slow, but never
+        // OOMs the inference task.
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
+
+        tokio::task::spawn_blocking(move || {
+            let send_tx = tx.clone();
+            let result = run_qwen3_inference(
+                &model_arc,
+                &messages,
+                &prompt_tokens_pre,
+                max_tokens,
+                temperature,
+                top_p,
+                &stop_sequences,
+                |chunk| -> bool {
+                    // `blocking_send` returns Err if the receiver is dropped
+                    // (client disconnected); use that as a cancel signal.
+                    send_tx.blocking_send(chunk).is_ok()
+                },
+            );
+            if let Err(e) = result {
+                let _ = tx.blocking_send(StreamChunk::Error(format!("{e:#}")));
+            }
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Box::pin(stream))
     }
 
     async fn prefill(
@@ -395,11 +452,13 @@ fn pick_dtype(model_dir: &Path, device: &Device) -> DType {
     }
 }
 
-fn load_qwen3_config(model_dir: &Path) -> anyhow::Result<Qwen3Config> {
+/// Generic per-architecture config loader. All Candle arch configs implement
+/// `serde::Deserialize` from the model's `config.json`.
+fn load_arch_config<C: serde::de::DeserializeOwned>(model_dir: &Path) -> anyhow::Result<C> {
     let cfg_path = model_dir.join("config.json");
     let text = std::fs::read_to_string(&cfg_path)
         .map_err(|e| anyhow::anyhow!("Cannot read {:?}: {e}", cfg_path))?;
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Invalid Qwen3 config: {e}"))
+    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Invalid arch config: {e}"))
 }
 
 /// Discover safetensors shards: `model.safetensors.index.json` for sharded
@@ -462,6 +521,138 @@ fn render_chat_template(template: &str, messages: &[ChatMessage]) -> anyhow::Res
         enable_thinking => false,
     })
     .map_err(|e| anyhow::anyhow!("Chat template render failed: {e}"))
+}
+
+/// Core inference loop, shared by `generate` and `generate_stream` and by all
+/// supported architectures (Qwen3 / Mistral / Phi-3 / Gemma3 — they all expose
+/// the same `forward(tokens, offset)` API).
+///
+/// `on_chunk` is invoked for every emitted [`StreamChunk`]. Returning `false`
+/// from the callback cancels generation immediately (used by SSE when the
+/// client disconnects).
+fn run_qwen3_inference(
+    model_arc: &Arc<LoadedCandleModel>,
+    messages: &[ChatMessage],
+    prompt_tokens_pre: &[u32],
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    stop_sequences: &[String],
+    mut on_chunk: impl FnMut(StreamChunk) -> bool,
+) -> anyhow::Result<()> {
+    let LoadedCandleModel {
+        model,
+        tokenizer,
+        chat_template,
+        eos_token_ids,
+        device,
+        ..
+    } = &**model_arc;
+
+    let prompt_ids: Vec<u32> = if !messages.is_empty() {
+        let prompt_text = render_chat_template(chat_template, messages)?;
+        tokenizer
+            .encode(prompt_text, true)
+            .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?
+            .get_ids()
+            .to_vec()
+    } else {
+        prompt_tokens_pre.to_vec()
+    };
+
+    if prompt_ids.is_empty() {
+        anyhow::bail!("Empty prompt: provide either messages or prompt_tokens");
+    }
+    let prompt_token_count = prompt_ids.len() as u32;
+
+    let mut model_guard = model.lock();
+    model_guard.clear_kv_cache();
+
+    let mut sampler = if temperature <= 1e-7 {
+        LogitsProcessor::from_sampling(rand::random(), Sampling::ArgMax)
+    } else if top_p <= 0.0 || top_p >= 1.0 {
+        LogitsProcessor::from_sampling(rand::random(), Sampling::All { temperature })
+    } else {
+        LogitsProcessor::from_sampling(rand::random(), Sampling::TopP { p: top_p, temperature })
+    };
+
+    // Prefill in one shot at offset = 0.
+    let prompt_tensor = Tensor::new(prompt_ids.as_slice(), device)
+        .and_then(|t| t.unsqueeze(0))
+        .map_err(|e| anyhow::anyhow!("Prompt tensor build failed: {e}"))?;
+    let logits = model_guard
+        .forward(&prompt_tensor, 0)
+        .map_err(|e| anyhow::anyhow!("Prefill forward failed: {e}"))?;
+    let logits = squeeze_to_1d(&logits)?;
+    let mut next = sampler
+        .sample(&logits)
+        .map_err(|e| anyhow::anyhow!("Sampler failed: {e}"))?;
+
+    let mut offset = prompt_ids.len();
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut tail = String::new(); // running concatenation of emitted text (for stop-seq scanning)
+    let mut decode_stream = tokenizer.decode_stream(true);
+    let mut finish_reason = String::from("length");
+
+    loop {
+        if eos_token_ids.contains(&next) {
+            finish_reason = "stop".into();
+            break;
+        }
+        generated.push(next);
+
+        // Stateful streaming decode: handles byte-fallback / BPE merges /
+        // multi-byte UTF-8 cleanly. May return None when waiting for follow-up
+        // bytes; that's expected — we just don't emit a token chunk this step.
+        let text_delta = decode_stream
+            .step(next)
+            .map_err(|e| anyhow::anyhow!("decode_stream.step failed: {e}"))?
+            .unwrap_or_default();
+
+        if !text_delta.is_empty() {
+            tail.push_str(&text_delta);
+            let keep_going = on_chunk(StreamChunk::Token {
+                token_id: next,
+                text_delta,
+            });
+            if !keep_going {
+                finish_reason = "cancelled".into();
+                break;
+            }
+            if !stop_sequences.is_empty()
+                && stop_sequences.iter().any(|s| !s.is_empty() && tail.contains(s))
+            {
+                finish_reason = "stop".into();
+                break;
+            }
+        }
+
+        if generated.len() >= max_tokens {
+            finish_reason = "length".into();
+            break;
+        }
+
+        // Decode step.
+        let input = Tensor::new(&[next], device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(|e| anyhow::anyhow!("Decode tensor build failed: {e}"))?;
+        let logits = model_guard
+            .forward(&input, offset)
+            .map_err(|e| anyhow::anyhow!("Decode forward failed: {e}"))?;
+        let logits = squeeze_to_1d(&logits)?;
+        next = sampler
+            .sample(&logits)
+            .map_err(|e| anyhow::anyhow!("Sampler failed: {e}"))?;
+        offset += 1;
+    }
+
+    on_chunk(StreamChunk::Done {
+        finish_reason,
+        prompt_tokens: prompt_token_count,
+        completion_tokens: generated.len() as u32,
+    });
+
+    Ok(())
 }
 
 /// `Qwen3ForCausalLM::forward` returns `[B=1, T=1, V]` after the internal

@@ -1,8 +1,8 @@
 //! Velox - The world's first Rust-native LLM inference server for Apple Silicon
 //!
 //! Usage from Tauri:
-//! ```rust
-//! let config = velox::ServerConfig { ... };
+//! ```ignore
+//! let config = velox::ServerConfig::default();
 //! tokio::spawn(velox::run_server(config));
 //! ```
 
