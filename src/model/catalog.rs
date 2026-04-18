@@ -68,13 +68,20 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_gb: 1.8,
         note: "Smaller Llama 3.2, fits anywhere.",
     },
-    // Mistral 7B (paged backend via load_paged_llama, no sliding window).
+    // Mistral 7B (paged backend via load_paged_llama).
     CatalogEntry {
         alias: "mistral-7b",
         repo_id: "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
         family: "mistral",
         size_gb: 4.1,
         note: "Mistral 7B v0.3 (no sliding window).",
+    },
+    CatalogEntry {
+        alias: "mistral-7b-v0.2",
+        repo_id: "mlx-community/Mistral-7B-Instruct-v0.2-4bit",
+        family: "mistral",
+        size_gb: 4.1,
+        note: "Mistral 7B v0.2 (sliding window 4096).",
     },
 ];
 

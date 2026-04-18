@@ -89,17 +89,10 @@ impl LlamaConfig {
     /// * Compute `head_dim` from `hidden_size / num_attention_heads`
     ///   if absent.
     /// * Default `num_key_value_heads` to `num_attention_heads` (MHA).
-    /// * Reject sliding-window (not supported in the paged backend).
+    /// * Forward `sliding_window` to the attention kernels (Mistral
+    ///   7B v0.1/v0.2 uses 4096; v0.3+ has it set to null).
     /// * `attention_bias` is always `false` for Llama / Mistral.
     pub fn to_internal(self) -> Result<Qwen3Config> {
-        if let Some(w) = self.sliding_window {
-            // Mistral 7B v0.1/v0.2 used 4096; v0.3+ doesn't. Llama
-            // never uses sliding window.
-            anyhow::bail!(
-                "sliding window attention (window={}) is not yet supported in the paged backend",
-                w
-            );
-        }
         let head_dim = self
             .head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads);
@@ -124,6 +117,7 @@ impl LlamaConfig {
             self.rms_norm_eps,
             self.hidden_act,
             self.quantization,
+            self.sliding_window,
         ))
     }
 }

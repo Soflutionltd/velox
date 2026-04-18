@@ -120,6 +120,7 @@ kernel void NAME(                                                              \
     constant uint  &head_dim          [[buffer(9)]],                           \
     constant uint  &page_size         [[buffer(10)]],                          \
     constant uint  &max_blocks        [[buffer(11)]],                          \
+    constant uint  &sliding_window    [[buffer(12)]],                          \
     uint3 tg_id                       [[threadgroup_position_in_grid]],        \
     uint3 tid_v                       [[thread_position_in_threadgroup]]       \
 ) {                                                                            \
@@ -129,6 +130,11 @@ kernel void NAME(                                                              \
     uint kv_groups = num_q_heads / num_kv_heads;                               \
     uint h_kv   = h_q / kv_groups;                                             \
     uint kv_len = kv_lens[seq_id];                                             \
+    /* Sliding window: only the most recent W keys are visible (Mistral      \
+     * v0.1/v0.2, Gemma 2/3 local layers). 0 = global attention. */          \
+    uint start  = (sliding_window > 0u && kv_len > sliding_window)             \
+                  ? (kv_len - sliding_window)                                  \
+                  : 0u;                                                        \
                                                                                \
     threadgroup float q_shared[D_MAX];                                         \
     threadgroup float scratch[D_MAX];                                          \
@@ -143,7 +149,7 @@ kernel void NAME(                                                              \
     float m = -INFINITY;                                                       \
     float l = 0.0;                                                             \
                                                                                \
-    for (uint pos = 0; pos < kv_len; pos++) {                                  \
+    for (uint pos = start; pos < kv_len; pos++) {                              \
         uint page_idx = pos / page_size;                                       \
         uint slot     = pos - page_idx * page_size;                            \
         uint page_id  = block_tables[seq_id * max_blocks + page_idx];          \
@@ -314,6 +320,7 @@ kernel void NAME(                                                              \
     constant uint  &head_dim          [[buffer(11)]],                          \
     constant uint  &page_size         [[buffer(12)]],                          \
     constant uint  &max_blocks        [[buffer(13)]],                          \
+    constant uint  &sliding_window    [[buffer(14)]],                          \
     uint3 tg_id                       [[threadgroup_position_in_grid]],        \
     uint3 tid_v                       [[thread_position_in_threadgroup]]       \
 ) {                                                                            \
@@ -327,6 +334,11 @@ kernel void NAME(                                                              \
     uint q_pos  = q_row - cu_seqlens[seq];                                     \
     uint abs_pos = kv_offsets[seq] + q_pos;                                    \
     uint kv_len = abs_pos + 1u;                                                \
+    /* Causal + sliding window: visible window is                             \
+     * [max(0, kv_len - W), kv_len). 0 = global attention. */                 \
+    uint start  = (sliding_window > 0u && kv_len > sliding_window)             \
+                  ? (kv_len - sliding_window)                                  \
+                  : 0u;                                                        \
                                                                                \
     threadgroup float q_shared[D_MAX];                                         \
     threadgroup float scratch[D_MAX];                                          \
@@ -341,7 +353,7 @@ kernel void NAME(                                                              \
     float m = -INFINITY;                                                       \
     float l = 0.0;                                                             \
                                                                                \
-    for (uint pos = 0; pos < kv_len; pos++) {                                  \
+    for (uint pos = start; pos < kv_len; pos++) {                              \
         uint page_idx = pos / page_size;                                       \
         uint slot     = pos - page_idx * page_size;                            \
         uint page_id  = block_tables[seq * max_blocks + page_idx];             \
@@ -968,6 +980,7 @@ pub fn paged_decode_attention(
     block_table: &Tensor,
     kv_lens: &Tensor,
     scale: f32,
+    sliding_window: u32,
 ) -> AnyResult<Tensor> {
     let device = q.device().clone();
     let metal_dev = match &device {
@@ -1099,6 +1112,7 @@ pub fn paged_decode_attention(
         encoder.set_bytes(9, &head_dim_u);
         encoder.set_bytes(10, &page_size_u);
         encoder.set_bytes(11, &max_blocks_u);
+        encoder.set_bytes(12, &sliding_window);
 
         let groups = MTLSize {
             width: n,
@@ -1125,6 +1139,7 @@ pub fn paged_decode_attention(
     _block_table: &Tensor,
     _kv_lens: &Tensor,
     _scale: f32,
+    _sliding_window: u32,
 ) -> AnyResult<Tensor> {
     bail!("paged_decode_attention is only available on macOS with the candle-metal feature")
 }
@@ -1420,6 +1435,7 @@ pub fn paged_prefill_attention(
     seq_id_per_q: &Tensor,
     kv_offsets: &Tensor,
     scale: f32,
+    sliding_window: u32,
 ) -> AnyResult<Tensor> {
     let device = q.device().clone();
     let metal_dev = match &device {
@@ -1558,6 +1574,7 @@ pub fn paged_prefill_attention(
         encoder.set_bytes(11, &head_dim_u);
         encoder.set_bytes(12, &page_size_u);
         encoder.set_bytes(13, &max_blocks_u);
+        encoder.set_bytes(14, &sliding_window);
 
         let groups = MTLSize {
             width: total_q,
@@ -1586,6 +1603,7 @@ pub fn paged_prefill_attention(
     _seq_id_per_q: &Tensor,
     _kv_offsets: &Tensor,
     _scale: f32,
+    _sliding_window: u32,
 ) -> AnyResult<Tensor> {
     bail!("paged_prefill_attention is only available on macOS with candle-metal")
 }
@@ -1895,6 +1913,9 @@ pub fn qmm_4bit_cpu(
 
 /// Pure-Rust reference implementation of `paged_decode_attention` for
 /// parity tests. All buffers laid out as in the Metal kernel.
+///
+/// `sliding_window`: 0 = global attention. Otherwise, only positions in
+/// `[max(0, kv_len - W), kv_len)` are visible to each query.
 pub fn paged_decode_attention_cpu(
     q: &[f32],
     k_pool: &[f32],
@@ -1908,6 +1929,7 @@ pub fn paged_decode_attention_cpu(
     page_size: usize,
     max_blocks: usize,
     scale: f32,
+    sliding_window: u32,
 ) -> Vec<f32> {
     let mut out = vec![0f32; n * h_q * head_dim];
     let kv_groups = h_q / h_kv;
@@ -1918,6 +1940,8 @@ pub fn paged_decode_attention_cpu(
             if kv_len == 0 {
                 continue;
             }
+            let w = sliding_window as usize;
+            let start = if w > 0 && kv_len > w { kv_len - w } else { 0 };
 
             // Online softmax to mirror what the kernel does (so any
             // numerical differences are due to dtype rounding, not the
@@ -1927,7 +1951,7 @@ pub fn paged_decode_attention_cpu(
             let mut acc = vec![0f32; head_dim];
             let q_off = (seq_id * h_q + hq) * head_dim;
 
-            for pos in 0..kv_len {
+            for pos in start..kv_len {
                 let page_id = block_table[seq_id * max_blocks + pos / page_size] as usize;
                 let slot = pos % page_size;
                 let base =

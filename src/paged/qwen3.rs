@@ -88,7 +88,9 @@ impl Qwen3Config {
         rms_norm_eps: f64,
         hidden_act: Activation,
         quantization: Option<QuantConfig>,
+        sliding_window: Option<usize>,
     ) -> Self {
+        let use_sliding_window = sliding_window.is_some();
         Self {
             vocab_size,
             hidden_size,
@@ -99,12 +101,12 @@ impl Qwen3Config {
             attention_bias: false,
             num_key_value_heads,
             max_position_embeddings,
-            sliding_window: None,
+            sliding_window,
             max_window_layers: 0,
             tie_word_embeddings,
             rope_theta,
             rms_norm_eps,
-            use_sliding_window: false,
+            use_sliding_window,
             hidden_act,
             quantization,
             _quantization_config_ignored: None,
@@ -354,6 +356,11 @@ struct PagedQwen3Attention {
     hidden_size: usize,
     rotary: Arc<RotaryEmbedding>,
     layer_idx: usize,
+    /// Sliding window size in tokens, or 0 for global attention.
+    /// Mistral 7B v0.1/v0.2 uses 4096; Qwen3 / Llama 3.x / Mistral
+    /// v0.3+ use 0. Per-layer override (every other layer) is used
+    /// by Gemma 2/3.
+    sliding_window: u32,
 }
 
 impl PagedQwen3Attention {
@@ -363,9 +370,15 @@ impl PagedQwen3Attention {
         layer_idx: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        if cfg.use_sliding_window {
-            anyhow::bail!("sliding window is not supported in paged backend");
-        }
+        // Sliding window: 0 = global attention. Mistral v0.1/v0.2 sets
+        // 4096. Qwen3's `use_sliding_window=false` => 0. Gemma 2/3 sets
+        // it per-layer (alternating local/global) which we'll handle
+        // via a future per-layer override.
+        let sliding_window: u32 = if cfg.use_sliding_window {
+            cfg.sliding_window.unwrap_or(0) as u32
+        } else {
+            0
+        };
         let head_dim = cfg.head_dim;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -394,6 +407,7 @@ impl PagedQwen3Attention {
             hidden_size,
             rotary,
             layer_idx,
+            sliding_window,
         })
     }
 
@@ -620,6 +634,7 @@ impl PagedQwen3Attention {
             &block_table,
             &kv_lens_t,
             scale,
+            self.sliding_window,
         )?; // [N, H_q, D]
 
         // 6) o_proj.
@@ -735,6 +750,7 @@ impl PagedQwen3Attention {
             &sid_t,
             &kvo_t,
             scale,
+            self.sliding_window,
         )?; // [total_q, H_q, D]
 
         // 5) o_proj.

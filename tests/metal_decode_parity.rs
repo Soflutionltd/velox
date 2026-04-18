@@ -84,8 +84,9 @@ fn run_parity(
     let bt_dev = Tensor::from_vec(block_table.clone(), (n, max_blocks), &device)?;
     let kvl_dev = Tensor::from_vec(kv_lens.clone(), n, &device)?;
 
-    let out_metal =
-        paged_decode_attention(&q_dev, &k_dev, &v_dev, &bt_dev, &kvl_dev, scale)?;
+    let out_metal = paged_decode_attention(
+        &q_dev, &k_dev, &v_dev, &bt_dev, &kvl_dev, scale, /*sliding_window=*/ 0,
+    )?;
     let out_metal_f32 = out_metal
         .to_device(&Device::Cpu)?
         .to_dtype(DType::F32)?
@@ -124,6 +125,7 @@ fn run_parity(
         page_size,
         max_blocks,
         scale,
+        /*sliding_window=*/ 0,
     );
 
     let (atol, rtol) = match dtype {

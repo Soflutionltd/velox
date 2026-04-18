@@ -236,6 +236,7 @@ fn ref_prefill(
             page_size,
             max_blocks,
             scale,
+            /*sliding_window=*/ 0,
         );
         out[q_off..q_off + h_q * head_dim].copy_from_slice(&out_one);
     }
@@ -276,7 +277,10 @@ fn prefill_parity_bf16_one_seq() {
     let sid = Tensor::from_vec(seq_id_per_q.clone(), total_q, &device).unwrap();
     let kvo = Tensor::from_vec(kv_offsets.clone(), 1, &device).unwrap();
 
-    let out = paged_prefill_attention(&q, &k, &v, &bt, &cu, &sid, &kvo, scale).unwrap();
+    let out = paged_prefill_attention(
+        &q, &k, &v, &bt, &cu, &sid, &kvo, scale, /*sliding_window=*/ 0,
+    )
+    .unwrap();
     let gpu = out.to_device(&Device::Cpu).unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
     let q_in = q.to_device(&Device::Cpu).unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -337,7 +341,10 @@ fn prefill_parity_bf16_mixed_batch() {
     let sid = Tensor::from_vec(seq_id_per_q.clone(), total_q, &device).unwrap();
     let kvo = Tensor::from_vec(kv_offsets.clone(), 3, &device).unwrap();
 
-    let out = paged_prefill_attention(&q, &k, &v, &bt, &cu, &sid, &kvo, scale).unwrap();
+    let out = paged_prefill_attention(
+        &q, &k, &v, &bt, &cu, &sid, &kvo, scale, /*sliding_window=*/ 0,
+    )
+    .unwrap();
     let gpu = out.to_device(&Device::Cpu).unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
     let q_in = q.to_device(&Device::Cpu).unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
