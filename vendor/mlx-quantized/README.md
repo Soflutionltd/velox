@@ -34,13 +34,27 @@ parity tests against the existing `qmm_4bit_cpu` reference. Every
 ported kernel becomes selectable via the `VELOX_QMM_BACKEND` env var
 (`velox` = current homemade, `mlx` = ported Apple kernels).
 
-| Kernel | Velox status | Used in |
-|--------|--------------|---------|
-| `qmv_fast` (M=1, the decode hot path) | TODO | single-stream decode |
-| `qmm_n` (general small M)             | TODO | multi-stream decode |
-| `qmm_t_aligned_n_b` (tiled GEMM)      | TODO | prefill |
-| `gather_qmm` (MoE)                    | TODO | future MoE |
-| `affine_quantize` / `affine_dequantize` | not needed (we have our own) | load-time quantization |
+| Kernel | Velox status | Used in | Speedup vs Velox-native |
+|--------|--------------|---------|-------------------------|
+| `qmv_fast` (M=1, the decode hot path) | **SHIPPED** (commit 2/6) | single-stream decode | **1.65× geomean** (1.33–2.09×) |
+| `qmm_n` (general small M)             | TODO | multi-stream decode | — |
+| `qmm_t_aligned_n_b` (tiled GEMM)      | TODO | prefill | — |
+| `gather_qmm` (MoE)                    | TODO | future MoE | — |
+| `affine_quantize` / `affine_dequantize` | not needed (we have our own) | load-time quantization | — |
+
+### qmv_fast bench (2026-04-18, M-series, bf16, group_size=64, M=1)
+
+| Shape (N × K)        | Velox naive | MLX-ported | Speedup |
+|----------------------|-------------|------------|---------|
+| 1024 × 1024          | 338 µs      | 255 µs     | 1.33×   |
+| 3072 × 1024          | 356 µs      | 243 µs     | 1.46×   |
+| 3584 × 3584 (Q3-7 q) | 586 µs      | 292 µs     | **2.00×** |
+| 4096 × 4096 (L8 q)   | 579 µs      | 294 µs     | **1.97×** |
+| 14336 × 4096 (L8 up) | 657 µs      | 450 µs     | 1.46×   |
+| 3072 × 3072 (Phi3 q) | 572 µs      | 273 µs     | **2.09×** |
+| 8192 × 3072 (Phi3 up)| 621 µs      | 345 µs     | 1.80×   |
+
+Reproduce with `cargo test --release --features candle-metal --test metal_qmv_mlx_bench -- --nocapture --test-threads=1`.
 
 ## Updating
 

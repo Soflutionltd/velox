@@ -66,24 +66,51 @@ impl Backend {
     }
 }
 
-/// MLX-ported quantized matmul stub.
+/// MLX-ported quantized matmul dispatcher.
 ///
-/// Returns `Err` until at least one ported kernel covers the requested
-/// shape. The dispatcher in `metal_kernels::qmm_4bit` is responsible for
-/// catching this error and falling back to the Velox-native kernel so
-/// that opt-in users never see a hard failure during the port.
+/// Routes the call to the most appropriate ported kernel for the given
+/// shape; `Err` if no port covers it yet. The dispatcher in
+/// `metal_kernels::qmm_4bit` catches this `Err` and falls back to the
+/// Velox-native kernel, so opt-in users never see a hard failure during
+/// the progressive port.
+///
+/// ## Currently routed
+///
+/// | Shape                                          | Kernel                |
+/// |------------------------------------------------|-----------------------|
+/// | M=1, gs=64, K%512==0, N%8==0, no bias          | `qmv_fast_mlx_g64`    |
+///
+/// ## Not yet ported (falls back)
+///
+/// * M ≥ 2 (decode multi-stream, prefill)          → port `qmm_n` next
+/// * group_size != 64                              → unroll the template
+/// * bias additive vector                          → fold into post-pass
 #[cfg(all(target_os = "macos", feature = "candle-metal"))]
 pub fn qmm_4bit_mlx(
-    _x: &Tensor,
-    _qweight: &Tensor,
-    _scales: &Tensor,
-    _biases: &Tensor,
-    _bias: Option<&Tensor>,
-    _group_size: usize,
+    x: &Tensor,
+    qweight: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    bias: Option<&Tensor>,
+    group_size: usize,
 ) -> AnyResult<Tensor> {
-    // Intentionally not yet implemented. Each ported kernel will replace
-    // this `bail!` with a real shape-eligibility match.
-    bail!("mlx backend: no ported kernel covers this shape yet")
+    use crate::paged::metal_kernels::{
+        qmv_fast_mlx_g64, QMV_FAST_MLX_BLOCK_K, QMV_FAST_MLX_GROUP, QMV_FAST_MLX_ROWS_PER_TG,
+    };
+
+    let (m, k) = x.dims2()?;
+    let (n, _) = qweight.dims2()?;
+
+    if m == 1
+        && bias.is_none()
+        && group_size == QMV_FAST_MLX_GROUP
+        && k % QMV_FAST_MLX_BLOCK_K == 0
+        && n % QMV_FAST_MLX_ROWS_PER_TG == 0
+    {
+        return qmv_fast_mlx_g64(x, qweight, scales, biases, group_size);
+    }
+
+    bail!("mlx backend: no ported kernel covers this shape yet (M={m} N={n} K={k} gs={group_size} bias={})", bias.is_some())
 }
 
 /// Non-Metal stub so the module compiles cross-platform (ports never

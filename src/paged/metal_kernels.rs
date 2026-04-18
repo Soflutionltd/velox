@@ -797,6 +797,121 @@ kernel void NAME(                                                              \
 QMM_4BIT_V2(qmm_4bit_v2_f32,  float)
 QMM_4BIT_V2(qmm_4bit_v2_f16,  half)
 QMM_4BIT_V2(qmm_4bit_v2_bf16, bfloat)
+
+// =====================================================================
+//   qmv_fast — MLX-ported, specialised for bits=4, group_size=64
+//
+// Direct port of `qmv_fast_impl` from Apple MLX
+// (vendor/mlx-quantized/kernels/quantized.h, MIT). The MLX template
+// version is unrolled here for the single (bits=4, gs=64) configuration
+// that covers every model in the velox-pull catalogue (Qwen3, Llama 3.x,
+// Mistral 7B v0.2/v0.3, Phi-3 mini).
+//
+// Why this is faster than `qmm_4bit` (naive) for the M=1 hot path:
+//   * 1 thread accumulates 4 output rows, not 1 — 4× fewer launches.
+//   * load_vector pre-divides activations by 1/16/256/4096 so the qdot
+//     inner loop reads each nibble *without shift*: `x*(w & 0x00f0)` is
+//     mathematically equal to `x*(nibble*16)`, and we already pre-divided
+//     x by 16. Saves 4 SHIFT instructions per uint16 of weights.
+//   * simd_sum() reduces 32 lanes in 5 cycles vs. our threadgroup-mem
+//     reductions.
+//
+// Layout requirements:
+//   * M = 1            (single token decode; for M > 1 fall back to qmm_4bit)
+//   * group_size = 64  (constant)
+//   * K % 512 == 0     (block_size = 16 values × 32 lanes = 512)
+//   * N % 8   == 0     (1 TG produces 8 output rows = 2 simdgroups × 4)
+//
+// Grid:   (1, N / 8, 1)
+// Threads/TG: 64       (2 simdgroups of 32)
+// =====================================================================
+#define MLX_QMV_FAST_4BIT_G64(NAME, T)                                            \
+kernel void NAME(                                                                  \
+    device const uint   *qweight        [[buffer(0)]],                             \
+    device const T      *scales         [[buffer(1)]],                             \
+    device const T      *biases         [[buffer(2)]],                             \
+    device const T      *x              [[buffer(3)]],                             \
+    device       T      *y              [[buffer(4)]],                             \
+    constant uint &in_vec_size          [[buffer(5)]],                             \
+    constant uint &out_vec_size         [[buffer(6)]],                             \
+    uint3 tid                           [[threadgroup_position_in_grid]],          \
+    uint  simd_gid                      [[simdgroup_index_in_threadgroup]],        \
+    uint  simd_lid                      [[thread_index_in_simdgroup]]              \
+) {                                                                                \
+    constexpr uint pack_factor          = 8u;                                      \
+    constexpr uint bytes_per_pack       = 4u;                                      \
+    constexpr uint packs_per_thread     = 2u;                                      \
+    constexpr uint num_simdgroups       = 2u;                                      \
+    constexpr uint results_per_simdgroup= 4u;                                      \
+    constexpr uint values_per_thread    = pack_factor * packs_per_thread; /* 16 */ \
+    constexpr uint block_size           = values_per_thread * 32u;       /* 512 */ \
+    constexpr uint scale_step           = 64u / values_per_thread;       /* 4   */ \
+                                                                                   \
+    const uint in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor; /* K/2 */\
+    const uint in_vec_size_g = in_vec_size / 64u;                                  \
+    const uint out_row = tid.y * (num_simdgroups * results_per_simdgroup)          \
+                       + simd_gid * results_per_simdgroup;                         \
+    if (out_row + results_per_simdgroup > out_vec_size) { return; }                \
+                                                                                   \
+    device const uint8_t *ws = (device const uint8_t*)qweight                      \
+                             + out_row * in_vec_size_w                             \
+                             + simd_lid * packs_per_thread * bytes_per_pack;       \
+    device const T *sl = scales + out_row * in_vec_size_g + simd_lid / scale_step; \
+    device const T *bl = biases + out_row * in_vec_size_g + simd_lid / scale_step; \
+    device const T *xp = x + tid.x * in_vec_size + simd_lid * values_per_thread;   \
+    device       T *yp = y + tid.x * out_vec_size + out_row;                       \
+                                                                                   \
+    float x_thread[values_per_thread];                                             \
+    float result[results_per_simdgroup] = {0.f, 0.f, 0.f, 0.f};                    \
+                                                                                   \
+    for (uint k = 0u; k < in_vec_size; k += block_size) {                          \
+        /* load_vector<bits=4>: pre-scale activations so qdot can read         */  \
+        /* nibbles unshifted (see kernel header comment).                      */  \
+        float sum = 0.f;                                                           \
+        for (uint i = 0u; i < values_per_thread; i += 4u) {                        \
+            float v0 = (float)xp[i+0];                                             \
+            float v1 = (float)xp[i+1];                                             \
+            float v2 = (float)xp[i+2];                                             \
+            float v3 = (float)xp[i+3];                                             \
+            sum += v0 + v1 + v2 + v3;                                              \
+            x_thread[i+0] = v0;                                                    \
+            x_thread[i+1] = v1 * (1.f / 16.f);                                     \
+            x_thread[i+2] = v2 * (1.f / 256.f);                                    \
+            x_thread[i+3] = v3 * (1.f / 4096.f);                                   \
+        }                                                                          \
+        /* qdot per output row. ws stride between rows = in_vec_size_w bytes   */  \
+        /* = K/2.  cast to uint16* to harvest 4 nibbles per read.              */  \
+        for (uint row = 0u; row < results_per_simdgroup; row++) {                  \
+            device const ushort *wrow =                                            \
+                (device const ushort*)(ws + row * in_vec_size_w);                  \
+            float s = (float)sl[row * in_vec_size_g];                              \
+            float b = (float)bl[row * in_vec_size_g];                              \
+            float accum = 0.f;                                                     \
+            for (uint i = 0u; i < (values_per_thread / 4u); i++) {                 \
+                ushort w = wrow[i];                                                \
+                accum += x_thread[4u*i + 0u] * (float)(w & 0x000fu)                \
+                       + x_thread[4u*i + 1u] * (float)(w & 0x00f0u)                \
+                       + x_thread[4u*i + 2u] * (float)(w & 0x0f00u)                \
+                       + x_thread[4u*i + 3u] * (float)(w & 0xf000u);               \
+            }                                                                      \
+            result[row] += s * accum + b * sum;                                    \
+        }                                                                          \
+        ws += block_size * bytes_per_pack / pack_factor; /* +256 bytes */          \
+        sl += block_size / 64u;                          /* +8 groups  */          \
+        bl += block_size / 64u;                                                    \
+        xp += block_size;                                                          \
+    }                                                                              \
+    for (uint row = 0u; row < results_per_simdgroup; row++) {                      \
+        float r = simd_sum(result[row]);                                           \
+        if (simd_lid == 0u) {                                                      \
+            yp[row] = (T)r;                                                        \
+        }                                                                          \
+    }                                                                              \
+}
+
+MLX_QMV_FAST_4BIT_G64(qmv_fast_mlx_g64_f32,  float)
+MLX_QMV_FAST_4BIT_G64(qmv_fast_mlx_g64_f16,  half)
+MLX_QMV_FAST_4BIT_G64(qmv_fast_mlx_g64_bf16, bfloat)
 "#;
 
 /// Per-process cache of compiled MSL libraries / pipelines, keyed by the
@@ -1804,6 +1919,139 @@ fn qmm_4bit_v2_kernel_name(dtype: DType) -> AnyResult<&'static str> {
         DType::BF16 => "qmm_4bit_v2_bf16",
         other => bail!("qmm_4bit_v2: unsupported activation dtype {other:?}"),
     })
+}
+
+/// MLX-ported `qmv_fast` (bits=4, group_size=64) kernel name lookup.
+fn qmv_fast_mlx_g64_kernel_name(dtype: DType) -> AnyResult<&'static str> {
+    Ok(match dtype {
+        DType::F32 => "qmv_fast_mlx_g64_f32",
+        DType::F16 => "qmv_fast_mlx_g64_f16",
+        DType::BF16 => "qmv_fast_mlx_g64_bf16",
+        other => bail!("qmv_fast_mlx_g64: unsupported activation dtype {other:?}"),
+    })
+}
+
+/// K block size of `qmv_fast_mlx_g64` (= values_per_thread × SIMD_SIZE).
+/// K must be a multiple of this for the kernel to be eligible.
+pub(crate) const QMV_FAST_MLX_BLOCK_K: usize = 512;
+/// Output rows produced per threadgroup (= num_simdgroups × results_per_simdgroup).
+/// N must be a multiple of this for the kernel to be eligible.
+pub(crate) const QMV_FAST_MLX_ROWS_PER_TG: usize = 8;
+/// The single group_size this kernel covers (bits is hard-coded to 4
+/// in the MSL macro `MLX_QMV_FAST_4BIT_G64`).
+pub(crate) const QMV_FAST_MLX_GROUP: usize = 64;
+
+/// Dispatch the MLX-ported `qmv_fast` (bits=4, group_size=64) kernel.
+///
+/// Eligibility (caller already verified shapes match `qmm_4bit`):
+///   * `m == 1`                       — single token decode
+///   * `group_size == 64`
+///   * `k % 512 == 0`
+///   * `n % 8 == 0`
+///   * `bias is None`                 — additive bias not supported by the
+///                                      ported kernel; M=1 inference doesn't
+///                                      need it for the standard projections
+///                                      we target (q/k/v/o, gate/up/down).
+///
+/// Returns `Ok(Y)` of shape `[1, N]` on success.
+#[cfg(all(target_os = "macos", feature = "candle-metal"))]
+pub fn qmv_fast_mlx_g64(
+    x: &Tensor,
+    qweight: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    group_size: usize,
+) -> AnyResult<Tensor> {
+    let device = x.device().clone();
+    let metal_dev = match &device {
+        Device::Metal(d) => d.clone(),
+        _ => bail!("qmv_fast_mlx_g64 requires Metal device"),
+    };
+    let (m, k) = x.dims2()?;
+    let (n, _k_packed) = qweight.dims2()?;
+    if m != 1 {
+        bail!("qmv_fast_mlx_g64 requires M=1, got {m}");
+    }
+    if group_size != QMV_FAST_MLX_GROUP {
+        bail!("qmv_fast_mlx_g64 requires group_size={QMV_FAST_MLX_GROUP}, got {group_size}");
+    }
+    if k % QMV_FAST_MLX_BLOCK_K != 0 {
+        bail!("qmv_fast_mlx_g64 requires K % {QMV_FAST_MLX_BLOCK_K} == 0, got K={k}");
+    }
+    if n % QMV_FAST_MLX_ROWS_PER_TG != 0 {
+        bail!("qmv_fast_mlx_g64 requires N % {QMV_FAST_MLX_ROWS_PER_TG} == 0, got N={n}");
+    }
+
+    let dtype = x.dtype();
+    let out = Tensor::zeros((m, n), dtype, &device)?;
+    let fn_name = qmv_fast_mlx_g64_kernel_name(dtype)?;
+    let pipeline = ensure_pipeline(&metal_dev, fn_name)?;
+    let elem_bytes = dtype.size_in_bytes();
+
+    let k_u = k as u32;
+    let n_u = n as u32;
+
+    {
+        let (x_st, x_l) = x.storage_and_layout();
+        let x_st = match &*x_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("X not metal"),
+        };
+        let (qw_st, qw_l) = qweight.storage_and_layout();
+        let qw_st = match &*qw_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("qweight not metal"),
+        };
+        let (sc_st, sc_l) = scales.storage_and_layout();
+        let sc_st = match &*sc_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("scales not metal"),
+        };
+        let (bi_st, bi_l) = biases.storage_and_layout();
+        let bi_st = match &*bi_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("biases not metal"),
+        };
+        let (out_st, out_l) = out.storage_and_layout();
+        let out_st = match &*out_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("out not metal"),
+        };
+
+        let x_off = x_l.start_offset() * elem_bytes;
+        let qw_off = qw_l.start_offset() * 4; // u32
+        let sc_off = sc_l.start_offset() * elem_bytes;
+        let bi_off = bi_l.start_offset() * elem_bytes;
+        let out_off = out_l.start_offset() * elem_bytes;
+
+        let encoder = metal_dev
+            .command_encoder()
+            .map_err(|e| anyhow!("qmv_fast_mlx_g64 encoder: {e}"))?;
+        encoder.set_label("velox.paged.qmv_fast_mlx_g64");
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(qw_st.buffer()), qw_off);
+        encoder.set_buffer(1, Some(sc_st.buffer()), sc_off);
+        encoder.set_buffer(2, Some(bi_st.buffer()), bi_off);
+        encoder.set_buffer(3, Some(x_st.buffer()), x_off);
+        encoder.set_buffer(4, Some(out_st.buffer()), out_off);
+        encoder.set_bytes(5, &k_u);
+        encoder.set_bytes(6, &n_u);
+
+        // Grid: (1, N/8, 1) TGs of 64 threads each (2 simdgroups × 32).
+        let tg_count = MTLSize {
+            width: 1,
+            height: n / QMV_FAST_MLX_ROWS_PER_TG,
+            depth: 1,
+        };
+        let threads_per_tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(tg_count, threads_per_tg);
+        drop(encoder);
+    }
+    Ok(out)
 }
 
 /// Int4 weight × FP activation matmul (MLX-quant format).
