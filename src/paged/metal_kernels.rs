@@ -661,6 +661,142 @@ kernel void NAME(                                                              \
 QMM_4BIT_TG(qmm_4bit_tg_f32,  float)
 QMM_4BIT_TG(qmm_4bit_tg_f16,  half)
 QMM_4BIT_TG(qmm_4bit_tg_bf16, bfloat)
+
+// =====================================================================
+//   qmm_4bit_v2  —  Multi-SIMD per TG with shared X tile
+// =====================================================================
+//
+// Real-GEMM-style 4-bit kernel. Each threadgroup outputs a (BM, BN)
+// tile. X is staged into threadgroup memory once per BK block, then
+// reused across all BN columns of the tile (BN-fold X-read amortization).
+// Each thread owns ONE output column n of the tile and accumulates BM
+// partial sums in registers.
+//
+// Layout:
+//   BM = 32 rows / TG    (covers a typical decode batch in one tile)
+//   BN = 64 cols / TG    (2 SIMDs × 32 threads each)
+//   BK = 64              (one MLX 4-bit group at group_size=64)
+//   2 SIMDs per TG       (64 threads total)
+//   X_shared : float[BM*BK]
+//
+// Why this beats the naive kernel at M ≥ 8:
+//   * naive : every (m,n) thread reads X[m,k] from device memory,
+//             so X is loaded N times.
+//   * v2    : X is loaded once into TG mem and reused across BN=64
+//             columns. For Qwen3 N ∈ {1024,2048,3072}, that's a
+//             16–48× reduction in X bandwidth.
+//   * Weight dequant happens once per (n, k) pair, same as naive.
+//   * Output writes are coalesced (per-row contiguous).
+//
+// Constraints (else fall back to naive on the host side):
+//   * group_size divides BK = 64       (true for MLX qmm 32/64)
+//   * K % BK == 0                      (true for all MLX shapes)
+//   * Bounds-checked on M & N: a partial tile is fine, no padding.
+
+#define BM_V2 32
+#define BN_V2 64
+#define BK_V2 64
+#define THREADS_V2 64
+
+#define QMM_4BIT_V2(NAME, T)                                                   \
+kernel void NAME(                                                              \
+    device const T    *X              [[buffer(0)]],                           \
+    device const uint *qweight        [[buffer(1)]],                           \
+    device const T    *scales         [[buffer(2)]],                           \
+    device const T    *biases         [[buffer(3)]],                           \
+    device const T    *bias_vec       [[buffer(4)]],                           \
+    device       T    *Y              [[buffer(5)]],                           \
+    constant uint &m_dim              [[buffer(6)]],                           \
+    constant uint &n_dim              [[buffer(7)]],                           \
+    constant uint &k_dim              [[buffer(8)]],                           \
+    constant uint &group_size         [[buffer(9)]],                           \
+    constant uint &has_bias           [[buffer(10)]],                          \
+    uint3 tg_id                       [[threadgroup_position_in_grid]],        \
+    uint3 tid_v                       [[thread_position_in_threadgroup]]       \
+) {                                                                            \
+    uint tid     = tid_v.x;                                                    \
+    uint m_start = tg_id.x * BM_V2;                                            \
+    uint n_start = tg_id.y * BN_V2;                                            \
+    uint n       = n_start + tid;   /* tid in [0..64), maps to col offset */   \
+                                                                               \
+    /* PRECONDITIONS (enforced by host dispatch):                              \
+        * m_dim % BM_V2 == 0  → every tile is full, no per-row guards needed  \
+        * n_start + tid < n_dim is checked; partial N tiles ARE supported    \
+        * k_dim % BK_V2 == 0  → exactly num_k_blocks K blocks                 \
+        * group_size divides BK_V2 */                                         \
+                                                                               \
+    threadgroup float X_shared[BM_V2 * BK_V2];                                 \
+                                                                               \
+    uint k_packed         = k_dim / 8u;                                        \
+    uint k_groups         = k_dim / group_size;                                \
+    uint num_k_blocks     = k_dim / BK_V2;                                     \
+    uint groups_per_block = BK_V2 / group_size;                                \
+    uint pkgs_per_group   = group_size / 8u;                                   \
+                                                                               \
+    float acc[BM_V2];                                                          \
+    for (uint mi = 0; mi < BM_V2; mi++) { acc[mi] = 0.0; }                     \
+                                                                               \
+    for (uint kb = 0; kb < num_k_blocks; kb++) {                               \
+        uint k_block_start = kb * BK_V2;                                       \
+                                                                               \
+        /* Cooperative load X[m_start..+BM, k_block_start..+BK] into          \
+           threadgroup memory. 64 threads × 32 elements = BM*BK. Full tile   \
+           by precondition, no bounds check inside the load. */               \
+        for (uint i = tid; i < BM_V2 * BK_V2; i += THREADS_V2) {               \
+            uint mi = i / BK_V2;                                               \
+            uint ki = i % BK_V2;                                               \
+            X_shared[i] = (float)X[(m_start + mi) * k_dim + k_block_start + ki];\
+        }                                                                      \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+                                                                               \
+        if (n < n_dim) {                                                       \
+            for (uint gb = 0; gb < groups_per_block; gb++) {                   \
+                uint kg = (k_block_start + gb * group_size) / group_size;      \
+                float scale = (float)scales[n * k_groups + kg];                \
+                float bias  = (float)biases[n * k_groups + kg];                \
+                uint kp_base = (k_block_start + gb * group_size) / 8u;         \
+                                                                               \
+                for (uint kp = 0; kp < pkgs_per_group; kp++) {                 \
+                    uint pkg = qweight[n * k_packed + kp_base + kp];           \
+                    uint k_in = gb * group_size + kp * 8u;                     \
+                    float w0 = (float)((pkg      ) & 0xFu) * scale + bias;     \
+                    float w1 = (float)((pkg >>  4) & 0xFu) * scale + bias;     \
+                    float w2 = (float)((pkg >>  8) & 0xFu) * scale + bias;     \
+                    float w3 = (float)((pkg >> 12) & 0xFu) * scale + bias;     \
+                    float w4 = (float)((pkg >> 16) & 0xFu) * scale + bias;     \
+                    float w5 = (float)((pkg >> 20) & 0xFu) * scale + bias;     \
+                    float w6 = (float)((pkg >> 24) & 0xFu) * scale + bias;     \
+                    float w7 = (float)((pkg >> 28) & 0xFu) * scale + bias;     \
+                                                                               \
+                    /* Compile-time-bounded inner loop → fully unrolled */    \
+                    for (uint mi = 0; mi < BM_V2; mi++) {                      \
+                        uint base = mi * BK_V2 + k_in;                         \
+                        acc[mi] += X_shared[base     ] * w0                    \
+                                 + X_shared[base + 1u] * w1                    \
+                                 + X_shared[base + 2u] * w2                    \
+                                 + X_shared[base + 3u] * w3                    \
+                                 + X_shared[base + 4u] * w4                    \
+                                 + X_shared[base + 5u] * w5                    \
+                                 + X_shared[base + 6u] * w6                    \
+                                 + X_shared[base + 7u] * w7;                   \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                          \
+                                                                               \
+    if (n < n_dim) {                                                           \
+        float bv = (has_bias != 0u) ? (float)bias_vec[n] : 0.0;                \
+        for (uint mi = 0; mi < BM_V2; mi++) {                                  \
+            Y[(m_start + mi) * n_dim + n] = (T)(acc[mi] + bv);                 \
+        }                                                                      \
+    }                                                                          \
+}
+
+QMM_4BIT_V2(qmm_4bit_v2_f32,  float)
+QMM_4BIT_V2(qmm_4bit_v2_f16,  half)
+QMM_4BIT_V2(qmm_4bit_v2_bf16, bfloat)
 "#;
 
 /// Per-process cache of compiled MSL libraries / pipelines, keyed by the
@@ -1652,6 +1788,24 @@ const QMM_TG_TN: usize = 32;
 /// the supported MLX-quant `group_size`.
 const QMM_TG_BK: usize = 64;
 
+/// Output row tile of the v2 multi-SIMD kernel — matches MSL `#define BM_V2`.
+const QMM_V2_BM: usize = 32;
+/// Output col tile of the v2 multi-SIMD kernel — matches MSL `#define BN_V2`.
+const QMM_V2_BN: usize = 64;
+/// K block of the v2 multi-SIMD kernel — matches MSL `#define BK_V2`.
+const QMM_V2_BK: usize = 64;
+/// Threads per TG for the v2 kernel — matches MSL `#define THREADS_V2`.
+const QMM_V2_THREADS: usize = 64;
+
+fn qmm_4bit_v2_kernel_name(dtype: DType) -> AnyResult<&'static str> {
+    Ok(match dtype {
+        DType::F32 => "qmm_4bit_v2_f32",
+        DType::F16 => "qmm_4bit_v2_f16",
+        DType::BF16 => "qmm_4bit_v2_bf16",
+        other => bail!("qmm_4bit_v2: unsupported activation dtype {other:?}"),
+    })
+}
+
 /// Int4 weight × FP activation matmul (MLX-quant format).
 ///
 /// Computes `Y = X @ W^T` where W is 4-bit MLX-quantized.
@@ -1729,14 +1883,15 @@ pub fn qmm_4bit(
 
     let out = Tensor::zeros((m, n), dtype, &device)?;
     // Dispatch policy:
-    //   * naive — 1 thread per output cell. Best on Apple GPUs at every
-    //             M tested (1, 8, 32) for Qwen3-shape workloads.
-    //   * tg / tiled — kept compiled but unused. Both lose to naive in
-    //                  benchmarks: tiled (SIMD-reduce) spills registers,
-    //                  tg (TM-amortized) under-saturates SIMDs at high M.
-    //                  Beating naive requires a real multi-SIMD-per-TG
-    //                  GEMM (à la mlx-c qmm), which is a much bigger
-    //                  undertaking. Tracked for a future Sprint.
+    //   * v2    — multi-SIMD-per-TG GEMM with shared X tile. Beats naive
+    //             at M ≥ QMM_V2_M_MIN by amortizing X-reads across BN=64
+    //             columns. Requires K % 64 == 0 and group_size | 64.
+    //   * naive — 1 thread per output cell. Best at M=1 (single decode),
+    //             where v2's tile overhead doesn't pay off.
+    //   * tg / tiled — kept compiled but unused (lost to naive in early
+    //             benches; superseded by v2). Touched here so the linker
+    //             doesn't strip them and we keep the pipelines warm for
+    //             future A/B benchmarking via env override.
     let _ = (
         qmm_4bit_tiled_kernel_name(dtype)?,
         QMM_TILED_M_MAX,
@@ -1746,7 +1901,32 @@ pub fn qmm_4bit(
         QMM_TG_TN,
         QMM_TG_BK,
     );
-    let fn_name = qmm_4bit_kernel_name(dtype)?;
+    // v2 eligibility — silent fallback to naive when shape doesn't fit.
+    // The v2 kernel requires *full* row tiles (no partial-M handling
+    // inside the kernel for compile-time loop unrolling), so we only
+    // enable it when M is an exact multiple of BM_V2. We also need
+    // ≥ 2 row tiles (M ≥ 2 × BM_V2) to give the GPU enough parallelism
+    // to amortize the per-TG launch overhead — at exactly 1 row tile,
+    // the (m_dim ÷ BM_V2 = 1) outer dim collapses scheduling into a
+    // single column sweep and naive wins.
+    // For small M (decode), naive wins anyway. Env override
+    // `VELOX_QMM_V2=0` forces naive (for benchmarking).
+    // Empirical sweet spot from `tests/metal_qmm_v2_bench.rs` on M-series:
+    // v2 beats naive by 1.3–1.9× when N ≥ 2048 (MLP up/down, MoE gates),
+    // ties or slightly loses on narrow N (≤1024 attn projections). We
+    // restrict v2 to wide-N matmuls and let naive handle narrow-N.
+    let v2_enabled = std::env::var("VELOX_QMM_V2").map(|v| v != "0").unwrap_or(true);
+    let v2_eligible = v2_enabled
+        && m >= QMM_V2_BM
+        && m % QMM_V2_BM == 0
+        && n >= 2048
+        && k % QMM_V2_BK == 0
+        && QMM_V2_BK % group_size == 0;
+    let fn_name = if v2_eligible {
+        qmm_4bit_v2_kernel_name(dtype)?
+    } else {
+        qmm_4bit_kernel_name(dtype)?
+    };
     let use_tg = false;
     let pipeline = ensure_pipeline(&metal_dev, fn_name)?;
     let elem_bytes = dtype.size_in_bytes();
@@ -1819,7 +1999,21 @@ pub fn qmm_4bit(
         encoder.set_bytes(9, &g_u);
         encoder.set_bytes(10, &has_bias_u);
 
-        if use_tg {
+        if v2_eligible {
+            // v2: one TG per (BM × BN) output tile, 64 threads per TG.
+            // Bounds-checked inside the kernel for partial M/N tiles.
+            let tg_count = MTLSize {
+                width: m.div_ceil(QMM_V2_BM),
+                height: n.div_ceil(QMM_V2_BN),
+                depth: 1,
+            };
+            let threads_per_tg = MTLSize {
+                width: QMM_V2_THREADS,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(tg_count, threads_per_tg);
+        } else if use_tg {
             // TG-tiled: one threadgroup per (TM × TN) output tile,
             // 32 threads per group (one SIMD).
             let tg_count = MTLSize {
