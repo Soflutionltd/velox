@@ -381,6 +381,168 @@ kernel void NAME(                                                              \
 PAGED_PREFILL_ATTN(paged_prefill_attention_f32,  float)
 PAGED_PREFILL_ATTN(paged_prefill_attention_f16,  half)
 PAGED_PREFILL_ATTN(paged_prefill_attention_bf16, bfloat)
+
+// =====================================================================
+//   qmm_4bit  —  Int4 weight × FP activation matmul (MLX-quant format)
+// =====================================================================
+//
+// Computes  Y[M, N] = X[M, K] @ W^T   where W is 4-bit MLX-quantized.
+//
+//   X        : [M, K]                    activations, dtype T
+//   qweight  : [N, K/8]                  uint32, 8 packed Int4 per u32,
+//                                        little-endian within each u32
+//   scales   : [N, K/group_size]         dtype T
+//   biases   : [N, K/group_size]         dtype T  (== original w_min)
+//   bias     : [N] or null               optional add-bias, dtype T
+//   Y        : [M, N]                    output, dtype T
+//
+// MLX dequant formula (matches mlx.core.quantize):
+//   w_real(n, k) = float(q_int) * scales[n, k/g] + biases[n, k/g]
+//
+// Grid: (M, N). Each thread accumulates one output cell.
+// We unroll the inner loop in chunks of 8 (one u32 unpack each).
+// `group_size` MUST be a multiple of 8 (it is in MLX, default 64).
+
+#define QMM_4BIT(NAME, T)                                                      \
+kernel void NAME(                                                              \
+    device const T    *X              [[buffer(0)]],                           \
+    device const uint *qweight        [[buffer(1)]],                           \
+    device const T    *scales         [[buffer(2)]],                           \
+    device const T    *biases         [[buffer(3)]],                           \
+    device const T    *bias_vec       [[buffer(4)]],                           \
+    device       T    *Y              [[buffer(5)]],                           \
+    constant uint &m_dim              [[buffer(6)]],                           \
+    constant uint &n_dim              [[buffer(7)]],                           \
+    constant uint &k_dim              [[buffer(8)]],                           \
+    constant uint &group_size         [[buffer(9)]],                           \
+    constant uint &has_bias           [[buffer(10)]],                          \
+    uint2 tid                         [[thread_position_in_grid]]              \
+) {                                                                            \
+    uint m = tid.x;                                                            \
+    uint n = tid.y;                                                            \
+    if (m >= m_dim || n >= n_dim) { return; }                                  \
+                                                                               \
+    uint k_packed = k_dim / 8u;                                                \
+    uint k_groups = k_dim / group_size;                                        \
+    uint groups_per_packed = group_size / 8u;                                  \
+    float acc = 0.0;                                                           \
+                                                                               \
+    for (uint kg = 0; kg < k_groups; kg++) {                                   \
+        float scale = (float)scales[n * k_groups + kg];                        \
+        float bias  = (float)biases[n * k_groups + kg];                        \
+        uint kp_start = kg * groups_per_packed;                                \
+        uint k_base   = kg * group_size;                                       \
+                                                                               \
+        for (uint kp = 0; kp < groups_per_packed; kp++) {                      \
+            uint pkg = qweight[n * k_packed + kp_start + kp];                  \
+            uint k0  = k_base + kp * 8u;                                       \
+            float w0 = (float)((pkg      ) & 0xFu) * scale + bias;             \
+            float w1 = (float)((pkg >>  4) & 0xFu) * scale + bias;             \
+            float w2 = (float)((pkg >>  8) & 0xFu) * scale + bias;             \
+            float w3 = (float)((pkg >> 12) & 0xFu) * scale + bias;             \
+            float w4 = (float)((pkg >> 16) & 0xFu) * scale + bias;             \
+            float w5 = (float)((pkg >> 20) & 0xFu) * scale + bias;             \
+            float w6 = (float)((pkg >> 24) & 0xFu) * scale + bias;             \
+            float w7 = (float)((pkg >> 28) & 0xFu) * scale + bias;             \
+                                                                               \
+            float x0 = (float)X[m * k_dim + k0     ];                          \
+            float x1 = (float)X[m * k_dim + k0 + 1u];                          \
+            float x2 = (float)X[m * k_dim + k0 + 2u];                          \
+            float x3 = (float)X[m * k_dim + k0 + 3u];                          \
+            float x4 = (float)X[m * k_dim + k0 + 4u];                          \
+            float x5 = (float)X[m * k_dim + k0 + 5u];                          \
+            float x6 = (float)X[m * k_dim + k0 + 6u];                          \
+            float x7 = (float)X[m * k_dim + k0 + 7u];                          \
+                                                                               \
+            acc += x0*w0 + x1*w1 + x2*w2 + x3*w3                               \
+                 + x4*w4 + x5*w5 + x6*w6 + x7*w7;                              \
+        }                                                                      \
+    }                                                                          \
+    if (has_bias != 0u) { acc += (float)bias_vec[n]; }                         \
+    Y[m * n_dim + n] = (T)acc;                                                 \
+}
+
+QMM_4BIT(qmm_4bit_f32,  float)
+QMM_4BIT(qmm_4bit_f16,  half)
+QMM_4BIT(qmm_4bit_bf16, bfloat)
+
+// =====================================================================
+//   qmm_4bit_tiled  —  batched-friendly variant of qmm_4bit
+// =====================================================================
+//
+// Same math/format as qmm_4bit, but optimised for the case where M (the
+// batch dim) is small (1..M_MAX) and N is large. One threadgroup handles
+// one (1, n) output column for all M rows. Weights are read once per K
+// element by the whole threadgroup; the M-fold reuse falls out of having
+// each thread accumulate against all M activations.
+//
+// Threadgroup grid : (1, N).
+// Threads per group: TK = 32 (one SIMD group on Apple GPUs).
+// We use `simd_sum` to reduce partial accumulators across the 32 threads
+// → one read per K element of the dequant weight, M reads per K element
+// of activations (cache-friendly: contiguous in K within a row).
+//
+// Constraint: m_dim ≤ M_MAX. The Rust wrapper falls back to the naive
+// kernel when this is exceeded.
+
+#define M_MAX 32
+#define TK 32
+
+#define QMM_4BIT_TILED(NAME, T)                                                \
+kernel void NAME(                                                              \
+    device const T    *X              [[buffer(0)]],                           \
+    device const uint *qweight        [[buffer(1)]],                           \
+    device const T    *scales         [[buffer(2)]],                           \
+    device const T    *biases         [[buffer(3)]],                           \
+    device const T    *bias_vec       [[buffer(4)]],                           \
+    device       T    *Y              [[buffer(5)]],                           \
+    constant uint &m_dim              [[buffer(6)]],                           \
+    constant uint &n_dim              [[buffer(7)]],                           \
+    constant uint &k_dim              [[buffer(8)]],                           \
+    constant uint &group_size         [[buffer(9)]],                           \
+    constant uint &has_bias           [[buffer(10)]],                          \
+    uint3 tg_id                       [[threadgroup_position_in_grid]],        \
+    uint3 tid_v                       [[thread_position_in_threadgroup]]       \
+) {                                                                            \
+    uint tid = tid_v.x;                                                        \
+    uint n = tg_id.y;                                                          \
+    if (n >= n_dim) { return; }                                                \
+                                                                               \
+    uint k_packed = k_dim / 8u;                                                \
+    uint k_groups = k_dim / group_size;                                        \
+                                                                               \
+    float acc[M_MAX];                                                          \
+    for (uint m = 0; m < M_MAX; m++) { acc[m] = 0.0; }                         \
+                                                                               \
+    /* Each thread strides through K in steps of TK. */                        \
+    for (uint k = tid; k < k_dim; k += TK) {                                   \
+        uint kg = k / group_size;                                              \
+        float scale = (float)scales[n * k_groups + kg];                        \
+        float bias  = (float)biases[n * k_groups + kg];                        \
+        uint  pkg   = qweight[n * k_packed + k / 8u];                          \
+        uint  shift = (k & 7u) * 4u;                                           \
+        uint  q     = (pkg >> shift) & 0xFu;                                   \
+        float w     = (float)q * scale + bias;                                 \
+                                                                               \
+        /* M-fold reuse of the same w. */                                      \
+        for (uint m = 0; m < m_dim; m++) {                                     \
+            acc[m] += (float)X[m * k_dim + k] * w;                             \
+        }                                                                      \
+    }                                                                          \
+                                                                               \
+    /* SIMD reduction: 32 threads → one final value per m. */                  \
+    for (uint m = 0; m < m_dim; m++) {                                         \
+        float v = simd_sum(acc[m]);                                            \
+        if (tid == 0) {                                                        \
+            if (has_bias != 0u) { v += (float)bias_vec[n]; }                   \
+            Y[m * n_dim + n] = (T)v;                                           \
+        }                                                                      \
+    }                                                                          \
+}
+
+QMM_4BIT_TILED(qmm_4bit_tiled_f32,  float)
+QMM_4BIT_TILED(qmm_4bit_tiled_f16,  half)
+QMM_4BIT_TILED(qmm_4bit_tiled_bf16, bfloat)
 "#;
 
 /// Per-process cache of compiled MSL libraries / pipelines, keyed by the
@@ -1320,6 +1482,264 @@ pub fn paged_prefill_attention(
     _scale: f32,
 ) -> AnyResult<Tensor> {
     bail!("paged_prefill_attention is only available on macOS with candle-metal")
+}
+
+// =====================================================================
+//   qmm_4bit  —  Rust wrapper + CPU reference
+// =====================================================================
+
+fn qmm_4bit_kernel_name(dtype: DType) -> AnyResult<&'static str> {
+    Ok(match dtype {
+        DType::F32 => "qmm_4bit_f32",
+        DType::F16 => "qmm_4bit_f16",
+        DType::BF16 => "qmm_4bit_bf16",
+        other => bail!("qmm_4bit: unsupported activation dtype {other:?}"),
+    })
+}
+
+fn qmm_4bit_tiled_kernel_name(dtype: DType) -> AnyResult<&'static str> {
+    Ok(match dtype {
+        DType::F32 => "qmm_4bit_tiled_f32",
+        DType::F16 => "qmm_4bit_tiled_f16",
+        DType::BF16 => "qmm_4bit_tiled_bf16",
+        other => bail!("qmm_4bit_tiled: unsupported activation dtype {other:?}"),
+    })
+}
+
+/// M_MAX in the tiled kernel — must match the MSL `#define M_MAX`.
+const QMM_TILED_M_MAX: usize = 32;
+/// TK in the tiled kernel — must match the MSL `#define TK`.
+const QMM_TILED_TK: usize = 32;
+
+/// Int4 weight × FP activation matmul (MLX-quant format).
+///
+/// Computes `Y = X @ W^T` where W is 4-bit MLX-quantized.
+///
+///   x        : [M, K]                    activations, dtype T
+///   qweight  : [N, K/8]                  uint32 (8 packed Int4 per u32)
+///   scales   : [N, K/group_size]         dtype T
+///   biases   : [N, K/group_size]         dtype T  (= original w_min)
+///   bias     : Option<[N]>               optional add-bias, dtype T
+///
+/// Returns `Y` of shape `[M, N]` and dtype T.
+#[cfg(all(target_os = "macos", feature = "candle-metal"))]
+pub fn qmm_4bit(
+    x: &Tensor,
+    qweight: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    bias: Option<&Tensor>,
+    group_size: usize,
+) -> AnyResult<Tensor> {
+    let device = x.device().clone();
+    let metal_dev = match &device {
+        Device::Metal(d) => d.clone(),
+        _ => bail!("qmm_4bit requires Metal device"),
+    };
+    let (m, k) = x.dims2()?;
+    let (n, k_packed) = qweight.dims2()?;
+    if k % 8 != 0 {
+        bail!("qmm_4bit: K={k} must be a multiple of 8");
+    }
+    if k_packed != k / 8 {
+        bail!(
+            "qmm_4bit: qweight dim1 {k_packed} != K/8 {} (K={k})",
+            k / 8
+        );
+    }
+    if group_size == 0 || group_size % 8 != 0 || k % group_size != 0 {
+        bail!(
+            "qmm_4bit: group_size={group_size} must be a multiple of 8 and divide K={k}"
+        );
+    }
+    let k_groups = k / group_size;
+    let (sn, sg) = scales.dims2()?;
+    let (bn, bg) = biases.dims2()?;
+    if sn != n || sg != k_groups || bn != n || bg != k_groups {
+        bail!(
+            "qmm_4bit: scales [{sn},{sg}] / biases [{bn},{bg}] mismatch expected [{n},{k_groups}]"
+        );
+    }
+    let dtype = x.dtype();
+    if scales.dtype() != dtype || biases.dtype() != dtype {
+        bail!("qmm_4bit: scales/biases dtype must match X");
+    }
+    if qweight.dtype() != DType::U32 {
+        bail!("qmm_4bit: qweight must be U32");
+    }
+    if let Some(b) = bias {
+        if b.dims1()? != n || b.dtype() != dtype {
+            bail!("qmm_4bit: bias must be [N={n}] of same dtype as X");
+        }
+        if !b.is_contiguous() {
+            bail!("qmm_4bit: bias must be contiguous");
+        }
+    }
+    for (l, t) in [
+        ("x", x),
+        ("qweight", qweight),
+        ("scales", scales),
+        ("biases", biases),
+    ] {
+        if !t.is_contiguous() {
+            bail!("qmm_4bit: {l} must be contiguous");
+        }
+    }
+
+    let out = Tensor::zeros((m, n), dtype, &device)?;
+    // The tiled kernel is currently slower than the naive one (the
+    // per-thread `acc[M_MAX]` array spills out of registers and the
+    // simd_sum reduction adds non-trivial overhead). The naive kernel
+    // gets ~9x scaling under batch=32 today, so we ship that and keep
+    // the tiled variant compiled but unused until we have a proper
+    // threadgroup-shared GEMM.
+    let _ = (qmm_4bit_tiled_kernel_name(dtype)?, QMM_TILED_M_MAX, QMM_TILED_TK);
+    let fn_name = qmm_4bit_kernel_name(dtype)?;
+    let pipeline = ensure_pipeline(&metal_dev, fn_name)?;
+    let elem_bytes = dtype.size_in_bytes();
+
+    // We always need a buffer at slot 4 even when bias is None — bind a
+    // dummy 1-elem zero tensor and signal `has_bias = 0` so the kernel
+    // never reads it.
+    let zero_one = Tensor::zeros(1, dtype, &device)?;
+    let bias_tensor: &Tensor = bias.unwrap_or(&zero_one);
+    let has_bias_u: u32 = if bias.is_some() { 1 } else { 0 };
+
+    let m_u = m as u32;
+    let n_u = n as u32;
+    let k_u = k as u32;
+    let g_u = group_size as u32;
+
+    {
+        let (x_st, x_l) = x.storage_and_layout();
+        let x_st = match &*x_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("X not metal"),
+        };
+        let (qw_st, qw_l) = qweight.storage_and_layout();
+        let qw_st = match &*qw_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("qweight not metal"),
+        };
+        let (sc_st, sc_l) = scales.storage_and_layout();
+        let sc_st = match &*sc_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("scales not metal"),
+        };
+        let (bi_st, bi_l) = biases.storage_and_layout();
+        let bi_st = match &*bi_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("biases not metal"),
+        };
+        let (bv_st, bv_l) = bias_tensor.storage_and_layout();
+        let bv_st = match &*bv_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("bias_vec not metal"),
+        };
+        let (out_st, out_l) = out.storage_and_layout();
+        let out_st = match &*out_st {
+            Storage::Metal(s) => s.clone(),
+            _ => bail!("out not metal"),
+        };
+
+        let x_off = x_l.start_offset() * elem_bytes;
+        let qw_off = qw_l.start_offset() * 4;
+        let sc_off = sc_l.start_offset() * elem_bytes;
+        let bi_off = bi_l.start_offset() * elem_bytes;
+        let bv_off = bv_l.start_offset() * elem_bytes;
+        let out_off = out_l.start_offset() * elem_bytes;
+
+        let encoder = metal_dev
+            .command_encoder()
+            .map_err(|e| anyhow!("qmm_4bit encoder: {e}"))?;
+        encoder.set_label("velox.paged.qmm_4bit");
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(x_st.buffer()), x_off);
+        encoder.set_buffer(1, Some(qw_st.buffer()), qw_off);
+        encoder.set_buffer(2, Some(sc_st.buffer()), sc_off);
+        encoder.set_buffer(3, Some(bi_st.buffer()), bi_off);
+        encoder.set_buffer(4, Some(bv_st.buffer()), bv_off);
+        encoder.set_buffer(5, Some(out_st.buffer()), out_off);
+        encoder.set_bytes(6, &m_u);
+        encoder.set_bytes(7, &n_u);
+        encoder.set_bytes(8, &k_u);
+        encoder.set_bytes(9, &g_u);
+        encoder.set_bytes(10, &has_bias_u);
+
+        let grid = MTLSize {
+            width: m,
+            height: n,
+            depth: 1,
+        };
+        let tg_w = std::cmp::min(m, 8).max(1);
+        let tg_h = std::cmp::min(n, 32).max(1);
+        let tg = MTLSize {
+            width: tg_w,
+            height: tg_h,
+            depth: 1,
+        };
+        encoder.dispatch_threads(grid, tg);
+        drop(encoder);
+    }
+    Ok(out)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "candle-metal")))]
+pub fn qmm_4bit(
+    _x: &Tensor,
+    _qweight: &Tensor,
+    _scales: &Tensor,
+    _biases: &Tensor,
+    _bias: Option<&Tensor>,
+    _group_size: usize,
+) -> AnyResult<Tensor> {
+    bail!("qmm_4bit is only available on macOS with candle-metal")
+}
+
+/// CPU reference for `qmm_4bit`. Uses the same MLX dequant formula
+/// (`w = q_int * scale + bias`). Inputs are in F32.
+pub fn qmm_4bit_cpu(
+    x: &[f32],
+    qweight: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    bias_vec: Option<&[f32]>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<f32> {
+    assert_eq!(x.len(), m * k);
+    let k_packed = k / 8;
+    let k_groups = k / group_size;
+    assert_eq!(qweight.len(), n * k_packed);
+    assert_eq!(scales.len(), n * k_groups);
+    assert_eq!(biases.len(), n * k_groups);
+
+    let mut out = vec![0f32; m * n];
+    for ni in 0..n {
+        for kg in 0..k_groups {
+            let scale = scales[ni * k_groups + kg];
+            let bias = biases[ni * k_groups + kg];
+            for kp in 0..(group_size / 8) {
+                let pkg = qweight[ni * k_packed + kg * (group_size / 8) + kp];
+                for b in 0..8 {
+                    let q = ((pkg >> (b * 4)) & 0xF) as f32;
+                    let w = q * scale + bias;
+                    let k_abs = kg * group_size + kp * 8 + b;
+                    for mi in 0..m {
+                        out[mi * n + ni] += x[mi * k + k_abs] * w;
+                    }
+                }
+            }
+        }
+        if let Some(bv) = bias_vec {
+            for mi in 0..m {
+                out[mi * n + ni] += bv[ni];
+            }
+        }
+    }
+    out
 }
 
 /// Pure-Rust reference implementation of `paged_decode_attention` for

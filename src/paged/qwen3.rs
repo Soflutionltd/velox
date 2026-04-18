@@ -48,6 +48,149 @@ pub struct Qwen3Config {
     #[serde(default)]
     pub use_sliding_window: bool,
     pub hidden_act: Activation,
+    /// MLX-quant config, present iff the checkpoint is 4-bit quantized.
+    /// MLX writes this both as `quantization` and (for HF compat)
+    /// `quantization_config`. Both serialize to the same shape so we
+    /// just read `quantization`; HF-only checkpoints would require a
+    /// manual fallback (none in the wild for MLX-quant).
+    #[serde(default)]
+    pub quantization: Option<QuantConfig>,
+    #[serde(default, rename = "quantization_config")]
+    _quantization_config_ignored: Option<serde_json::Value>,
+}
+
+/// MLX 4-bit quantization parameters (parsed from the model's
+/// `config.json` `quantization_config` field, or `quantization` for
+/// older mlx-community dumps).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+pub struct QuantConfig {
+    pub bits: usize,
+    pub group_size: usize,
+}
+
+/// A linear layer that may be either a regular `Linear` or a 4-bit
+/// MLX-quant `QLinear`. Same forward interface either way.
+#[derive(Debug)]
+pub enum MaybeQLinear {
+    Plain(Linear),
+    Q(QLinear),
+}
+
+impl MaybeQLinear {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            MaybeQLinear::Plain(l) => Ok(l.forward(x)?),
+            MaybeQLinear::Q(q) => q.forward(x),
+        }
+    }
+}
+
+/// 4-bit MLX-quantized linear layer.
+///
+/// Storage matches MLX exactly:
+///   weight  : [N, K/8]            U32 packed (8 Int4 per u32, little-endian)
+///   scales  : [N, K/group_size]   activation dtype
+///   biases  : [N, K/group_size]   activation dtype  (= original w_min)
+///   bias    : Option<[N]>         activation dtype  (Linear's add-bias)
+#[derive(Debug)]
+pub struct QLinear {
+    pub qweight: Tensor,
+    pub scales: Tensor,
+    pub biases: Tensor,
+    pub bias: Option<Tensor>,
+    pub group_size: usize,
+    pub in_features: usize,
+    pub out_features: usize,
+}
+
+impl QLinear {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // qmm_4bit expects 2D X. Flatten leading dims, restore after.
+        let original_shape = x.dims().to_vec();
+        let k = self.in_features;
+        let leading: usize = original_shape[..original_shape.len() - 1].iter().product();
+        let x2d = x.reshape((leading, k))?.contiguous()?;
+        #[cfg(all(target_os = "macos", feature = "candle-metal"))]
+        {
+            let y = super::metal_kernels::qmm_4bit(
+                &x2d,
+                &self.qweight,
+                &self.scales,
+                &self.biases,
+                self.bias.as_ref(),
+                self.group_size,
+            )?;
+            let mut new_shape = original_shape.clone();
+            *new_shape.last_mut().unwrap() = self.out_features;
+            return Ok(y.reshape(new_shape)?);
+        }
+        #[cfg(not(all(target_os = "macos", feature = "candle-metal")))]
+        {
+            let _ = x2d;
+            anyhow::bail!("QLinear::forward requires macOS + candle-metal feature");
+        }
+    }
+}
+
+/// Build a `MaybeQLinear` from a VarBuilder. If `q_cfg` is `Some` we
+/// load `weight` (U32 packed), `scales`, `biases`, and optional `bias`.
+/// Otherwise we fall back to `linear_b` / `linear_no_bias`.
+fn maybe_qlinear(
+    in_features: usize,
+    out_features: usize,
+    bias: bool,
+    vb: VarBuilder,
+    q_cfg: Option<&QuantConfig>,
+) -> Result<MaybeQLinear> {
+    if let Some(q) = q_cfg {
+        if q.bits != 4 {
+            anyhow::bail!("velox only supports 4-bit MLX quant (got bits={})", q.bits);
+        }
+        let g = q.group_size;
+        if in_features % g != 0 {
+            anyhow::bail!(
+                "QLinear: in_features {in_features} not divisible by group_size {g}"
+            );
+        }
+        if in_features % 8 != 0 {
+            anyhow::bail!("QLinear: in_features {in_features} not multiple of 8");
+        }
+        let qweight = vb.get_with_hints_dtype(
+            (out_features, in_features / 8),
+            "weight",
+            Default::default(),
+            DType::U32,
+        )?;
+        let scales = vb.get((out_features, in_features / g), "scales")?;
+        let biases = vb.get((out_features, in_features / g), "biases")?;
+        let b = if bias {
+            Some(vb.get(out_features, "bias")?)
+        } else {
+            None
+        };
+        Ok(MaybeQLinear::Q(QLinear {
+            qweight,
+            scales,
+            biases,
+            bias: b,
+            group_size: g,
+            in_features,
+            out_features,
+        }))
+    } else if bias {
+        Ok(MaybeQLinear::Plain(linear_b(
+            in_features,
+            out_features,
+            true,
+            vb,
+        )?))
+    } else {
+        Ok(MaybeQLinear::Plain(linear_no_bias(
+            in_features,
+            out_features,
+            vb,
+        )?))
+    }
 }
 
 /// One step of the batched forward pass. All requests in the batch share
@@ -120,20 +263,21 @@ impl RotaryEmbedding {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Qwen3MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: MaybeQLinear,
+    up_proj: MaybeQLinear,
+    down_proj: MaybeQLinear,
     act_fn: Activation,
 }
 
 impl Qwen3MLP {
     fn new(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
+        let q = cfg.quantization.as_ref();
         Ok(Self {
-            gate_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?,
+            gate_proj: maybe_qlinear(cfg.hidden_size, cfg.intermediate_size, false, vb.pp("gate_proj"), q)?,
+            up_proj: maybe_qlinear(cfg.hidden_size, cfg.intermediate_size, false, vb.pp("up_proj"), q)?,
+            down_proj: maybe_qlinear(cfg.intermediate_size, cfg.hidden_size, false, vb.pp("down_proj"), q)?,
             act_fn: cfg.hidden_act,
         })
     }
@@ -141,18 +285,20 @@ impl Qwen3MLP {
 
 impl Module for Qwen3MLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let lhs = x.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = x.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let lhs = self.gate_proj.forward(x).map_err(candle_core::Error::wrap)?
+            .apply(&self.act_fn)?;
+        let rhs = self.up_proj.forward(x).map_err(candle_core::Error::wrap)?;
+        let h = (lhs * rhs)?;
+        self.down_proj.forward(&h).map_err(candle_core::Error::wrap)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PagedQwen3Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: MaybeQLinear,
+    k_proj: MaybeQLinear,
+    v_proj: MaybeQLinear,
+    o_proj: MaybeQLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -178,10 +324,11 @@ impl PagedQwen3Attention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
-        let q_proj = linear_b(cfg.hidden_size, num_heads * head_dim, cfg.attention_bias, vb.pp("q_proj"))?;
-        let k_proj = linear_b(cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias, vb.pp("k_proj"))?;
-        let v_proj = linear_b(cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias, vb.pp("v_proj"))?;
-        let o_proj = linear_b(num_heads * head_dim, cfg.hidden_size, cfg.attention_bias, vb.pp("o_proj"))?;
+        let q_cfg = cfg.quantization.as_ref();
+        let q_proj = maybe_qlinear(cfg.hidden_size, num_heads * head_dim, cfg.attention_bias, vb.pp("q_proj"), q_cfg)?;
+        let k_proj = maybe_qlinear(cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias, vb.pp("k_proj"), q_cfg)?;
+        let v_proj = maybe_qlinear(cfg.hidden_size, num_kv_heads * head_dim, cfg.attention_bias, vb.pp("v_proj"), q_cfg)?;
+        let o_proj = maybe_qlinear(num_heads * head_dim, cfg.hidden_size, cfg.attention_bias, vb.pp("o_proj"), q_cfg)?;
         let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
         let hidden_size = head_dim * cfg.num_attention_heads;
@@ -685,7 +832,7 @@ fn scatter_into_pool(pool: &Tensor, value: &Tensor, page_id: u32, slot: u32) -> 
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DecoderLayer {
     self_attn: PagedQwen3Attention,
     mlp: Qwen3MLP,
@@ -717,12 +864,12 @@ impl DecoderLayer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PagedQwen3 {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: MaybeQLinear,
     cfg: Qwen3Config,
     pub device: Device,
     pub dtype: DType,
@@ -730,8 +877,10 @@ pub struct PagedQwen3 {
 
 impl PagedQwen3 {
     pub fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        // For MLX-quant checkpoints, embed_tokens is also stored as
+        // qweight + scales + biases. We detect that and dequantize it
+        // once at load time so the rest of the model stays unchanged.
+        let embed_tokens = load_embedding(cfg, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
@@ -740,9 +889,15 @@ impl PagedQwen3 {
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            MaybeQLinear::Plain(Linear::new(embed_tokens.embeddings().clone(), None))
         } else {
-            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            maybe_qlinear(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                vb.pp("lm_head"),
+                cfg.quantization.as_ref(),
+            )?
         };
         Ok(Self {
             embed_tokens,
@@ -785,4 +940,62 @@ impl PagedQwen3 {
         let logits = self.lm_head.forward(&last)?;
         Ok(logits)
     }
+}
+
+/// Load the embedding table. For MLX-quant checkpoints, the table is
+/// stored as `weight` (U32 packed) + `scales` + `biases` and we
+/// dequantize it once at load time. For plain checkpoints we just defer
+/// to `candle_nn::embedding`.
+fn load_embedding(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Embedding> {
+    let qcfg = match &cfg.quantization {
+        None => return Ok(candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb)?),
+        Some(q) => q,
+    };
+    // Try the quant triplet first; if scales is missing, the embed table
+    // was kept full-precision in this checkpoint.
+    let n = cfg.vocab_size;
+    let k = cfg.hidden_size;
+    let g = qcfg.group_size;
+    let dtype = vb.dtype();
+    let dev = vb.device().clone();
+
+    if k % g != 0 || k % 8 != 0 {
+        return Ok(candle_nn::embedding(n, k, vb)?);
+    }
+    let scales_res = vb.get((n, k / g), "scales");
+    if scales_res.is_err() {
+        return Ok(candle_nn::embedding(n, k, vb)?);
+    }
+
+    let qweight = vb.get_with_hints_dtype(
+        (n, k / 8),
+        "weight",
+        Default::default(),
+        DType::U32,
+    )?;
+    let scales = scales_res?;
+    let biases = vb.get((n, k / g), "biases")?;
+
+    // Dequantize on CPU (this happens once, embed table is small).
+    let qw_cpu: Vec<u32> = qweight.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+    let sc_cpu: Vec<f32> = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let bi_cpu: Vec<f32> = biases.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let k_packed = k / 8;
+    let k_groups = k / g;
+    let mut dq = vec![0f32; n * k];
+    for ni in 0..n {
+        for kg in 0..k_groups {
+            let scale = sc_cpu[ni * k_groups + kg];
+            let bias = bi_cpu[ni * k_groups + kg];
+            for kp in 0..(g / 8) {
+                let pkg = qw_cpu[ni * k_packed + kg * (g / 8) + kp];
+                for b in 0..8 {
+                    let q = ((pkg >> (b * 4)) & 0xF) as f32;
+                    dq[ni * k + kg * g + kp * 8 + b] = q * scale + bias;
+                }
+            }
+        }
+    }
+    let table = Tensor::from_vec(dq, (n, k), &dev)?.to_dtype(dtype)?;
+    Ok(Embedding::new(table, k))
 }
