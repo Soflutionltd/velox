@@ -1881,6 +1881,19 @@ pub fn qmm_4bit(
         }
     }
 
+    // MLX backend opt-in. When `VELOX_QMM_BACKEND=mlx`, try the
+    // ported Apple kernels first; on `Err` (shape not yet covered),
+    // silently fall through to the Velox-native dispatcher below. This
+    // keeps the env switch safe to flip in production while we land
+    // ported kernels one shape at a time.
+    if super::mlx_kernels::Backend::from_env() == super::mlx_kernels::Backend::Mlx {
+        if let Ok(t) =
+            super::mlx_kernels::qmm_4bit_mlx(x, qweight, scales, biases, bias, group_size)
+        {
+            return Ok(t);
+        }
+    }
+
     let out = Tensor::zeros((m, n), dtype, &device)?;
     // Dispatch policy:
     //   * v2    — multi-SIMD-per-TG GEMM with shared X tile. Beats naive
