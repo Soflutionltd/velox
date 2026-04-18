@@ -20,8 +20,18 @@ pub enum ModelType {
     Reranker,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
 pub struct GenerateRequest {
+    /// Pre-tokenized prompt (used when caller already tokenized)
     pub prompt_tokens: Vec<u32>,
+    /// Chat messages (backend will apply chat template + tokenize)
+    /// If non-empty, takes precedence over prompt_tokens
+    pub messages: Vec<ChatMessage>,
     pub max_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,

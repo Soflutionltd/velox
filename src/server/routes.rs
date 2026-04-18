@@ -70,48 +70,99 @@ pub struct Usage {
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Json<ChatCompletionResponse> {
+) -> Json<serde_json::Value> {
     tracing::info!("POST /v1/chat/completions model={}", req.model);
 
-    let backend = state.pool.backend_arc();
+    // Resolve and load the model through the engine pool
+    let handle = match state.pool.get_model(&req.model).await {
+        Ok(h) => h,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": {
+                    "message": format!("Model load failed: {e}"),
+                    "type": "model_not_found",
+                }
+            }));
+        }
+    };
+
+    let messages: Vec<ChatMessage> = req
+        .messages
+        .iter()
+        .map(|m| ChatMessage {
+            role: m.role.clone(),
+            content: extract_text_content(&m.content),
+        })
+        .collect();
+
     let gen_req = GenerateRequest {
         prompt_tokens: vec![],
+        messages,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: 0.95,
         stop_sequences: vec![],
     };
 
-    // Create a dummy handle (real model loading happens in engine pool)
-    let handle = ModelHandle {
-        id: req.model.clone(),
-        path: String::new(),
-        model_type: ModelType::Llm,
-        params_total: 0,
-        params_active: 0,
+    let backend = state.pool.backend_arc();
+    let result = match backend.generate(&handle, &gen_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("generate failed: {e:#}");
+            return Json(serde_json::json!({
+                "error": {
+                    "message": format!("Generation failed: {e}"),
+                    "type": "inference_error",
+                }
+            }));
+        }
     };
 
-    let response_text = match backend.generate(&handle, &gen_req).await {
-        Ok(result) => result.text,
-        Err(e) => format!("Error: {e}"),
-    };
-
-    Json(ChatCompletionResponse {
+    let response = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".into(),
         created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
         model: req.model,
         choices: vec![Choice {
             index: 0,
             message: Message {
                 role: "assistant".into(),
-                content: serde_json::json!(response_text),
+                content: serde_json::Value::String(result.text),
             },
-            finish_reason: Some("stop".into()),
+            finish_reason: Some(result.finish_reason),
         }],
-        usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    })
+        usage: Usage {
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
+            total_tokens: result.prompt_tokens + result.completion_tokens,
+        },
+    };
+
+    Json(serde_json::to_value(response).unwrap())
+}
+
+/// Extract plain text from an OpenAI message content field.
+/// Supports both string content and the array-of-parts format.
+fn extract_text_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                let t = p.get("type")?.as_str()?;
+                if t == "text" {
+                    p.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 async fn completions(Json(_req): Json<serde_json::Value>) -> Json<serde_json::Value> {

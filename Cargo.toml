@@ -38,10 +38,36 @@ bytes = "1"
 anyhow = "1"
 thiserror = "2"
 shellexpand = "3"
+rand = "0.9"
+
+# Tokenizer (used by both Candle and MLX backends, also re-exported via candle)
+tokenizers = { version = "0.22", optional = true }
+
+# Candle inference (default backend — pure Rust, Metal acceleration on Apple Silicon)
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+# Jinja2-compatible templating for HF tokenizer chat templates
+minijinja = { version = "2", optional = true, features = ["loader"] }
+minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
+
+# MLX inference — disabled by default. mlx-lm 0.0.1 (crates.io) has a critical
+# attention/cache bug that causes garbage output during decode. We pin to the
+# `main` branch where the RoPE-offset fix landed, but other inference bugs
+# remain. Use only when upstream is verified working (Phase 2).
+mlx-rs = { git = "https://github.com/oxideai/mlx-rs", branch = "main", optional = true }
+mlx-lm = { git = "https://github.com/oxideai/mlx-rs", branch = "main", optional = true }
+mlx-lm-utils = { git = "https://github.com/oxideai/mlx-rs", branch = "main", optional = true }
+
+# HuggingFace model download
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
 
 [features]
-default = ["mlx"]
-mlx = []
+# On Apple Silicon, the default is Candle + Metal GPU acceleration.
+default = ["candle-metal"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib"]
+candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+mlx = ["dep:mlx-rs", "dep:mlx-lm", "dep:mlx-lm-utils", "dep:tokenizers"]
 llamacpp = []
 
 [[bin]]

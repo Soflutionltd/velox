@@ -33,6 +33,34 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let model_path = PathBuf::from(&model_dir);
     std::fs::create_dir_all(&model_path)?;
 
+    // Bootstrap: if no model is discovered, download a small default Qwen3 model
+    let initial_models = crate::model::discovery::discover_models(&model_path);
+    if initial_models.is_empty() {
+        // Pick a default repo per backend. Candle reads stock HF safetensors,
+        // MLX reads the mlx-community quantized variants.
+        let default_repo = match backend_name.as_str() {
+            "mlx" => "mlx-community/Qwen3-0.6B-bf16",
+            _ => "Qwen/Qwen3-0.6B",
+        };
+        tracing::info!(
+            "No model found in {:?}. Downloading {} (default for {} backend)…",
+            model_path, default_repo, backend_name
+        );
+        let req = crate::model::download::DownloadRequest {
+            repo_id: default_repo.to_string(),
+            target_dir: model_path.clone(),
+            revision: None,
+        };
+        match crate::model::download::download_model(&req, |p| {
+            tracing::info!("[download] {}/{} {}", p.files_done, p.files_total, p.current_file);
+        })
+        .await
+        {
+            Ok(dir) => tracing::info!("Default model ready at {:?}", dir),
+            Err(e) => tracing::error!("Default model download failed: {e:#}"),
+        }
+    }
+
     // Create engine pool
     let pool = Arc::new(EnginePool::new(
         inference_backend,

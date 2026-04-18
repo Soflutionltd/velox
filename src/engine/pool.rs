@@ -90,23 +90,50 @@ impl EnginePool {
     }
 
     async fn evict_if_needed(&self, needed_bytes: u64) {
-        let mut models = self.models.write();
-        let current: u64 = models.values().map(|m| m.size_bytes).sum();
-        if current + needed_bytes <= self.max_memory_bytes { return; }
-
-        // Sort by last_used (oldest first), skip pinned
-        let mut evict_candidates: Vec<(String, std::time::Instant)> = models.iter()
-            .filter(|(_, m)| !m.pinned)
-            .map(|(k, m)| (k.clone(), m.last_used))
-            .collect();
-        evict_candidates.sort_by_key(|(_, t)| *t);
-
-        for (name, _) in evict_candidates {
-            if current + needed_bytes <= self.max_memory_bytes { break; }
-            if let Some(removed) = models.remove(&name) {
-                tracing::info!("Evicting model: {} (LRU)", name);
-                let _ = self.backend.unload_model(&removed.handle).await;
+        // Phase 1: figure out what to evict while holding the lock briefly,
+        // then release before awaiting backend.unload_model to keep the
+        // surrounding future Send.
+        let to_evict: Vec<(String, ModelHandle)> = {
+            let models = self.models.read();
+            let current: u64 = models.values().map(|m| m.size_bytes).sum();
+            if current + needed_bytes <= self.max_memory_bytes {
+                return;
             }
+            let mut candidates: Vec<(String, std::time::Instant, u64)> = models
+                .iter()
+                .filter(|(_, m)| !m.pinned)
+                .map(|(k, m)| (k.clone(), m.last_used, m.size_bytes))
+                .collect();
+            candidates.sort_by_key(|(_, t, _)| *t);
+
+            let mut planned: Vec<(String, ModelHandle)> = Vec::new();
+            let mut freed: u64 = 0;
+            for (name, _, size) in candidates {
+                if current + needed_bytes <= self.max_memory_bytes + freed {
+                    break;
+                }
+                if let Some(loaded) = models.get(&name) {
+                    planned.push((
+                        name.clone(),
+                        ModelHandle {
+                            id: loaded.handle.id.clone(),
+                            path: loaded.handle.path.clone(),
+                            model_type: loaded.handle.model_type.clone(),
+                            params_total: loaded.handle.params_total,
+                            params_active: loaded.handle.params_active,
+                        },
+                    ));
+                    freed += size;
+                }
+            }
+            planned
+        };
+
+        for (name, handle) in to_evict {
+            // Remove from map (short critical section, no await held)
+            self.models.write().remove(&name);
+            tracing::info!("Evicting model: {} (LRU)", name);
+            let _ = self.backend.unload_model(&handle).await;
         }
     }
 
