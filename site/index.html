@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en" class="bg-zinc-950 text-zinc-100 antialiased">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Velox — Rust-native LLM inference for Apple Silicon</title>
+    <meta
+      name="description"
+      content="The world's first Rust-native LLM inference server for Apple Silicon. Continuous batching, paged KV cache, MLX-Int4, prefix cache, gRPC + UDS + HTTP."
+    />
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      :root {
+        font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+        font-feature-settings: 'cv11', 'ss01', 'kern' 1;
+      }
+      html { scroll-behavior: smooth; }
+      pre code { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+      .grid-bg {
+        background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0);
+        background-size: 32px 32px;
+      }
+      .glow {
+        box-shadow:
+          0 0 0 1px rgba(255,255,255,0.04),
+          0 1px 2px rgba(0,0,0,0.3),
+          0 8px 24px rgba(0,0,0,0.45),
+          0 32px 96px -32px rgba(132, 204, 22, 0.18);
+      }
+    </style>
+  </head>
+  <body class="min-h-screen">
+    <!-- NAV -->
+    <header class="sticky top-0 z-50 backdrop-blur-xl bg-zinc-950/70 border-b border-white/5">
+      <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+        <a href="#" class="flex items-center gap-2 font-semibold tracking-tight">
+          <span class="inline-block size-2 rounded-full bg-lime-400 shadow-[0_0_12px_rgba(132,204,22,0.7)]"></span>
+          Velox
+        </a>
+        <nav class="hidden md:flex items-center gap-8 text-sm text-zinc-400">
+          <a class="hover:text-white transition" href="#features">Features</a>
+          <a class="hover:text-white transition" href="#bench">Benchmarks</a>
+          <a class="hover:text-white transition" href="#install">Install</a>
+          <a class="hover:text-white transition" href="https://github.com/Soflutionltd/velox">GitHub →</a>
+        </nav>
+      </div>
+    </header>
+
+    <!-- HERO -->
+    <section class="relative overflow-hidden">
+      <div class="absolute inset-0 grid-bg opacity-60 [mask-image:linear-gradient(to_bottom,white,transparent)]"></div>
+      <div class="relative max-w-6xl mx-auto px-6 pt-20 pb-32 lg:pt-32 lg:pb-44">
+        <div class="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-zinc-300">
+          <span class="size-1.5 rounded-full bg-lime-400 animate-pulse"></span>
+          v0.1 — open source, Apache 2.0
+        </div>
+
+        <h1 class="mt-6 text-5xl sm:text-6xl lg:text-7xl font-bold tracking-tighter leading-[0.95]">
+          The world's first
+          <span class="block">Rust-native LLM</span>
+          <span class="block text-zinc-500">
+            <span class="text-lime-400">inference server</span> for Apple Silicon.
+          </span>
+        </h1>
+
+        <p class="mt-8 max-w-2xl text-lg text-zinc-400 leading-relaxed">
+          Single static binary. Zero GC. <strong class="text-zinc-200">Continuous batching</strong>,
+          <strong class="text-zinc-200">paged KV cache</strong>, fused Metal kernels,
+          MLX-Int4, dynamic quantization, prefix cache, speculative decoding.
+          OpenAI- and Anthropic-compatible. Triple transport: HTTP, Unix socket, gRPC.
+        </p>
+
+        <div class="mt-10 flex flex-wrap items-center gap-4">
+          <a
+            href="#install"
+            class="inline-flex items-center gap-2 rounded-xl bg-lime-400 hover:bg-lime-300 text-zinc-950 font-semibold px-6 py-3.5 transition-all duration-200 ease-out hover:scale-[1.02] glow"
+          >
+            Install Velox
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+          </a>
+          <a
+            href="https://github.com/Soflutionltd/velox"
+            class="inline-flex items-center gap-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-100 font-medium px-6 py-3.5 transition-all duration-200"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.3.5-2.4 1.2-3.2-.2-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.4 2.9.2 3.2.7.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></svg>
+            Star on GitHub
+          </a>
+        </div>
+
+        <!-- Code chip -->
+        <div class="mt-12 max-w-2xl rounded-xl bg-zinc-900/80 border border-white/10 backdrop-blur p-5 font-mono text-sm">
+          <pre class="overflow-x-auto"><code><span class="text-zinc-500"># Install (macOS Apple Silicon)</span>
+$ <span class="text-lime-400">curl -fsSL https://velox.soflution.com/install.sh | sh</span>
+
+<span class="text-zinc-500"># Start the server</span>
+$ <span class="text-lime-400">velox serve --model-dir ~/.velox/models</span></code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section id="features" class="border-t border-white/5">
+      <div class="max-w-6xl mx-auto px-6 py-24 lg:py-32">
+        <div class="max-w-2xl">
+          <p class="text-xs uppercase tracking-widest text-lime-400 font-semibold">What it does</p>
+          <h2 class="mt-3 text-4xl sm:text-5xl font-bold tracking-tighter">
+            Built for serving real workloads, not chatbot demos.
+          </h2>
+          <p class="mt-6 text-lg text-zinc-400 leading-relaxed">
+            Most LLM runtimes on Mac (Ollama, mlx-lm, llama.cpp) optimize for
+            <em>one developer, one chat</em>. Velox is built for the next thing:
+            multi-tenant, multi-model, low-latency, OpenAI-compatible serving
+            on a Mac Studio under your desk.
+          </p>
+        </div>
+
+        <div class="mt-16 grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <!-- Card -->
+          <div class="rounded-2xl bg-white/[0.02] border border-white/[0.06] p-7 hover:bg-white/[0.04] transition-all duration-200">
+            <div class="size-9 rounded-lg bg-lime-400/10 border border-lime-400/30 flex items-center justify-center text-lime-400">⚡</div>
+            <h3 class="mt-5 font-semibold text-lg">Continuous batching</h3>
+            <p class="mt-2 text-sm text-zinc-400 leading-relaxed">
+              New requests join the in-flight batch every step.
+              Per-token cost stays flat as concurrency grows — 1 user
+              and 16 users share the GPU efficiently.
+            </p>
+          </div>
+          <div class="rounded-2xl bg-white/[0.02] border border-white/[0.06] p-7 hover:bg-white/[0.04] transition-all duration-200">
+            <div class="size-9 rounded-lg bg-fuchsia-400/10 border border-fuchsia-400/30 flex items-center justify-center text-fuchsia-300">▦</div>
+            <h3 class="mt-5 font-semibold text-lg">Paged KV cache</h3>
+            <p class="mt-2 text-sm text-zinc-400 leading-relaxed">
+              vLLM-style page allocator (16-token pages). Packs 2-4× more
+              concurrent requests in the same VRAM than naive
+              max-seq allocation.
+            </p>
+          </div>
+          <div class="rounded-2xl bg-white/[0.02] border border-white/[0.06] p-7 hover:bg-white/[0.04] transition-all duration-200">
+            <div class="size-9 rounded-lg bg-amber-400/10 border border-amber-400/30 flex items-center justify-center text-amber-300">▣</div>
+            <h3 class="mt-5 font-semibold text-lg">Fused Metal kernels</h3>
+            <p class="mt-2 text-sm text-zinc-400 leading-relaxed">
+              Custom MSL kernels for paged decode/prefill attention,
+              batched RoPE, batched scatter, and qmm_4bit dequant.
+              Compiled into the binary.
+            </p>
+          </div>
+          <div class="rounded-2xl bg-white/[0.02] border border-white/[0.06] p-7 hover:bg-white/[0.04] transition-all duration-200">
+            <div class="size-9 rounded-lg bg-cyan-400/10 border border-cyan-400/30 flex items-center justify-center text-cyan-300">⌘</div>
+            <h3 class="mt-5 font-semibold text-lg">Prefix cache</h3>
+            <p class="mt-2 text-sm text-zinc-400 leading-relaxed">
+              Page-level KV cache deduplication for shared system
+              prompts. Measured <strong class="text-zinc-100">6.5×
+              speedup</strong> on repeated long-context conversations.
+            </p>
+          </div>
+          <div class="rounded-2xl bg-white/[0.02] border border-white/[0.06] p-7 hover:bg-white/[0.04] transition-all duration-200">
+            <div class="size-9 rounded-lg bg-orange-400/10 border border-orange-400/30 flex items-center justify-center text-orange-300">≡</div>
+            <h3 class="mt-5 font-semibold text-lg">MLX-Int4 + dynamic quant</h3>
+            <p class="mt-2 text-sm text-zinc-400 leading-relaxed">
+              Run mlx-community 4-bit checkpoints natively, or dynamically
+              quantize any BF16 model at load time. 4× memory reduction
+              over BF16.
+            </p>
+          </div>
+          <div class="rounded-2xl bg-white/[0.02] border border-white/[0.06] p-7 hover:bg-white/[0.04] transition-all duration-200">
+            <div class="size-9 rounded-lg bg-rose-400/10 border border-rose-400/30 flex items-center justify-center text-rose-300">⇄</div>
+            <h3 class="mt-5 font-semibold text-lg">Triple transport</h3>
+            <p class="mt-2 text-sm text-zinc-400 leading-relaxed">
+              HTTP (OpenAI + Anthropic compat), Unix domain socket
+              (~30µs faster locally), and gRPC with HTTP/2 streaming
+              for typed clients. All same port, same scheduler.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BENCHMARKS -->
+    <section id="bench" class="border-t border-white/5 bg-zinc-900/30">
+      <div class="max-w-6xl mx-auto px-6 py-24 lg:py-32">
+        <p class="text-xs uppercase tracking-widest text-lime-400 font-semibold">Honest benchmarks</p>
+        <h2 class="mt-3 text-4xl sm:text-5xl font-bold tracking-tighter">
+          We're slower than mlx-lm for one user.<br>
+          We're <span class="text-lime-400">9.7× faster</span> for sixteen.
+        </h2>
+        <p class="mt-6 max-w-2xl text-lg text-zinc-400 leading-relaxed">
+          On Qwen3-0.6B-4bit (Apple Silicon, MLX-Int4), greedy decoding,
+          200 tokens. Numbers are real, reproducible, and not cherry-picked.
+        </p>
+
+        <div class="mt-12 grid md:grid-cols-2 gap-6">
+          <div class="rounded-2xl bg-white/[0.03] border border-white/10 p-8">
+            <p class="text-sm text-zinc-500 uppercase tracking-wider">Single-stream</p>
+            <div class="mt-3 flex items-baseline gap-3">
+              <span class="text-5xl font-bold text-zinc-100">49</span>
+              <span class="text-zinc-500">tok/s</span>
+            </div>
+            <p class="mt-1 text-sm text-rose-400">5.5× slower than mlx-lm (271 tok/s)</p>
+            <p class="mt-4 text-sm text-zinc-400 leading-relaxed">
+              Per-step Metal kernel-launch overhead in Candle. Closing
+              this gap with fused decode-layer kernels is roadmap item #1.
+            </p>
+          </div>
+          <div class="rounded-2xl bg-gradient-to-br from-lime-500/[0.08] to-transparent border border-lime-400/30 p-8">
+            <p class="text-sm text-lime-300 uppercase tracking-wider">Concurrent (16 users)</p>
+            <div class="mt-3 flex items-baseline gap-3">
+              <span class="text-5xl font-bold text-lime-400">478</span>
+              <span class="text-zinc-500">tok/s aggregate</span>
+            </div>
+            <p class="mt-1 text-sm text-lime-300">mlx-lm doesn't even ship concurrent serving</p>
+            <p class="mt-4 text-sm text-zinc-300 leading-relaxed">
+              Continuous batching + paged KV. We beat mlx-lm starting at
+              <strong>2 concurrent users</strong>. Read the full numbers
+              and methodology in <a href="https://github.com/Soflutionltd/velox/blob/main/BENCHMARKS.md" class="underline hover:text-lime-200">BENCHMARKS.md</a>.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INSTALL -->
+    <section id="install" class="border-t border-white/5">
+      <div class="max-w-6xl mx-auto px-6 py-24 lg:py-32">
+        <p class="text-xs uppercase tracking-widest text-lime-400 font-semibold">Install</p>
+        <h2 class="mt-3 text-4xl sm:text-5xl font-bold tracking-tighter">
+          One command. Apple Silicon required.
+        </h2>
+
+        <div class="mt-12 grid lg:grid-cols-2 gap-6">
+          <div class="rounded-2xl bg-zinc-950 border border-white/10 p-8">
+            <div class="flex items-center gap-2 text-sm text-zinc-500">
+              <span class="inline-block size-2 rounded-full bg-zinc-600"></span>
+              Quick install (recommended)
+            </div>
+            <pre class="mt-5 overflow-x-auto text-sm font-mono text-zinc-300"><code>curl -fsSL https://velox.soflution.com/install.sh | sh
+
+velox serve --model-dir ~/.velox/models</code></pre>
+          </div>
+          <div class="rounded-2xl bg-zinc-950 border border-white/10 p-8">
+            <div class="flex items-center gap-2 text-sm text-zinc-500">
+              <span class="inline-block size-2 rounded-full bg-zinc-600"></span>
+              Homebrew tap
+            </div>
+            <pre class="mt-5 overflow-x-auto text-sm font-mono text-zinc-300"><code>brew tap soflutionltd/tap \
+  https://github.com/Soflutionltd/velox
+
+brew install velox</code></pre>
+          </div>
+          <div class="rounded-2xl bg-zinc-950 border border-white/10 p-8 lg:col-span-2">
+            <div class="flex items-center gap-2 text-sm text-zinc-500">
+              <span class="inline-block size-2 rounded-full bg-zinc-600"></span>
+              Build from source
+            </div>
+            <pre class="mt-5 overflow-x-auto text-sm font-mono text-zinc-300"><code>git clone https://github.com/Soflutionltd/velox &amp;&amp; cd velox
+brew install protobuf
+cargo install --path . --features candle-metal</code></pre>
+          </div>
+        </div>
+
+        <div class="mt-12 rounded-2xl bg-white/[0.02] border border-white/[0.06] p-8">
+          <h3 class="font-semibold text-lg">Requirements</h3>
+          <ul class="mt-4 space-y-2 text-sm text-zinc-400">
+            <li class="flex gap-2"><span class="text-lime-400">→</span> macOS 14+ on Apple Silicon (M1, M2, M3, M4)</li>
+            <li class="flex gap-2"><span class="text-lime-400">→</span> 8 GB unified memory minimum (16 GB recommended for 7B+ models)</li>
+            <li class="flex gap-2"><span class="text-lime-400">→</span> Rust 1.78+ and protoc (for building from source)</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer class="border-t border-white/5">
+      <div class="max-w-6xl mx-auto px-6 py-12 flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
+        <div class="flex items-center gap-2 text-zinc-500 text-sm">
+          <span class="inline-block size-1.5 rounded-full bg-lime-400"></span>
+          Velox is open source · Apache 2.0
+        </div>
+        <div class="flex items-center gap-6 text-sm text-zinc-500">
+          <a href="https://github.com/Soflutionltd/velox" class="hover:text-zinc-200">GitHub</a>
+          <a href="https://github.com/Soflutionltd/velox/blob/main/BENCHMARKS.md" class="hover:text-zinc-200">Benchmarks</a>
+          <a href="https://github.com/Soflutionltd/velox/blob/main/README.md" class="hover:text-zinc-200">Docs</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
