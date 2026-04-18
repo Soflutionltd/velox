@@ -940,6 +940,25 @@ impl PagedQwen3 {
         let logits = self.lm_head.forward(&last)?;
         Ok(logits)
     }
+
+    /// Like [`Self::forward`] but returns logits for **every** input
+    /// position, not just the last per-request. Shape: `[total_tokens, vocab]`.
+    /// Used by speculative decoding's verification pass, which needs one
+    /// logit row per drafted candidate.
+    pub fn forward_all(&self, step: &BatchStep<'_>, pages: &PagedKvCache) -> Result<Tensor> {
+        let total = step.input_ids.dim(0)?;
+        debug_assert_eq!(total, step.seqs.iter().map(|s| s.new_tokens).sum::<usize>());
+
+        let mut h = self.embed_tokens.forward(step.input_ids)?;
+
+        for layer in &self.layers {
+            h = layer.forward(&h, step.seqs, pages)?;
+        }
+
+        let h = self.norm.forward(&h)?;
+        let logits = self.lm_head.forward(&h)?;
+        Ok(logits)
+    }
 }
 
 /// Load the embedding table. For MLX-quant checkpoints, the table is

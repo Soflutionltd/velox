@@ -18,6 +18,7 @@
 //! scheduler via an mpsc channel of [`SubmitRequest`]s.
 
 use super::pages::PagedKvCache;
+use super::prefix_cache::PrefixCache;
 use super::qwen3::{BatchStep, PagedQwen3, SeqSlice};
 use super::request::{safe_text_delta, Request, RequestId, RequestStatus};
 use crate::backend::traits::{ChatMessage, StreamChunk};
@@ -42,6 +43,9 @@ pub struct SchedulerConfig {
     pub max_batch_tokens: usize,
     /// Idle sleep when the run queue is empty and no work to do.
     pub idle_sleep: Duration,
+    /// Max number of prefix-cached pages to keep alive across requests.
+    /// 0 disables the prefix cache entirely.
+    pub prefix_cache_capacity: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -50,6 +54,7 @@ impl Default for SchedulerConfig {
             max_running_requests: 64,
             max_batch_tokens: 512,
             idle_sleep: Duration::from_millis(2),
+            prefix_cache_capacity: 256,
         }
     }
 }
@@ -79,6 +84,8 @@ pub struct BatchScheduler {
     waiting: Mutex<VecDeque<Request>>,
     /// Currently-running requests. Indexed by RequestId for quick removal.
     running: Mutex<HashMap<RequestId, Request>>,
+    /// Page-level prefix cache. None when capacity == 0.
+    prefix_cache: Option<Mutex<PrefixCache>>,
 
     shutdown: AtomicBool,
     stats: Mutex<SchedulerStats>,
@@ -92,6 +99,9 @@ pub struct SchedulerStats {
     pub requests_aborted: u64,
     pub last_batch_size: usize,
     pub last_step_us: u64,
+    pub prefix_cache_hits: u64,
+    pub prefix_cache_misses: u64,
+    pub prefix_tokens_skipped: u64,
 }
 
 impl BatchScheduler {
@@ -103,6 +113,14 @@ impl BatchScheduler {
         eos_token_ids: Vec<u32>,
         cfg: SchedulerConfig,
     ) -> Self {
+        let prefix_cache = if cfg.prefix_cache_capacity > 0 {
+            Some(Mutex::new(PrefixCache::new(
+                pages.clone(),
+                cfg.prefix_cache_capacity,
+            )))
+        } else {
+            None
+        };
         Self {
             model,
             pages,
@@ -112,6 +130,7 @@ impl BatchScheduler {
             cfg,
             waiting: Mutex::new(VecDeque::new()),
             running: Mutex::new(HashMap::new()),
+            prefix_cache,
             shutdown: AtomicBool::new(false),
             stats: Mutex::new(SchedulerStats::default()),
         }
@@ -157,6 +176,8 @@ impl BatchScheduler {
             status: RequestStatus::Waiting,
             created_at: Instant::now(),
             admitted_at: None,
+            cached_prefix_pages: 0,
+            prefix_chain_hash: 0,
             tx: sub.tx,
             decoded_text: String::new(),
         };
@@ -194,7 +215,8 @@ impl BatchScheduler {
     }
 
     /// Move requests from `waiting` to `running` while we have free pages
-    /// and capacity.
+    /// and capacity. Consults the prefix cache to skip prefill on shared
+    /// prompt prefixes.
     fn admit_waiting(&self) {
         let mut waiting = self.waiting.lock();
         let mut running = self.running.lock();
@@ -204,23 +226,67 @@ impl BatchScheduler {
             let Some(mut req) = waiting.pop_front() else {
                 break;
             };
-            // Worst-case page need: full prompt + full max_new_tokens.
-            let pages_needed = req.pages_required(page_size, req.max_new_tokens);
-            match self.pages.alloc(pages_needed) {
-                Some(blocks) => {
-                    req.block_table = blocks;
+
+            // 1) Consult the prefix cache.
+            let (cached_pages, cached_tokens, end_hash) = if let Some(cache) = &self.prefix_cache {
+                let mut c = cache.lock();
+                let hit = c.lookup(&req.prompt_tokens);
+                if hit.matched_pages.is_empty() {
+                    let mut s = self.stats.lock();
+                    s.prefix_cache_misses += 1;
+                } else {
+                    let mut s = self.stats.lock();
+                    s.prefix_cache_hits += 1;
+                    s.prefix_tokens_skipped += hit.matched_tokens as u64;
+                    tracing::debug!(
+                        "{}: prefix cache hit, skipped {} tokens ({} pages)",
+                        req.id,
+                        hit.matched_tokens,
+                        hit.matched_pages.len()
+                    );
+                }
+                (hit.matched_pages, hit.matched_tokens, hit.next_chain_hash)
+            } else {
+                (Vec::new(), 0, 0u64)
+            };
+
+            // 2) Worst-case page need for the WHOLE sequence (cached + suffix +
+            //    generation). The cached portion is already covered.
+            let total_pages_needed = req.pages_required(page_size, req.max_new_tokens);
+            let pages_to_alloc = total_pages_needed.saturating_sub(cached_pages.len());
+
+            let new_blocks = if pages_to_alloc == 0 {
+                Some(Vec::new())
+            } else {
+                self.pages.alloc(pages_to_alloc)
+            };
+
+            match new_blocks {
+                Some(extra) => {
+                    let mut block_table = cached_pages.clone();
+                    block_table.extend(extra);
+
+                    req.block_table = block_table;
+                    req.cached_prefix_pages = cached_pages.len();
+                    req.prefix_chain_hash = end_hash;
+                    req.seq_len = cached_tokens;
                     req.status = RequestStatus::Running;
                     req.admitted_at = Some(Instant::now());
                     tracing::debug!(
-                        "{}: admitted (prompt_len={}, pages={})",
+                        "{}: admitted (prompt_len={}, pages={}, cached_pages={})",
                         req.id,
                         req.prompt_tokens.len(),
-                        pages_needed
+                        total_pages_needed,
+                        cached_pages.len()
                     );
                     running.insert(req.id, req);
                 }
                 None => {
-                    // Not enough pages; put back and try later.
+                    // Not enough pages; release any cache refs we just took
+                    // and try this request again next round.
+                    if !cached_pages.is_empty() {
+                        self.pages.free_pages(cached_pages);
+                    }
                     waiting.push_front(req);
                     break;
                 }
@@ -407,6 +473,33 @@ impl BatchScheduler {
         // Reap finished requests.
         for id in &to_remove {
             if let Some(req) = running.remove(id) {
+                // Insert the freshly-prefilled prompt pages into the prefix
+                // cache so subsequent requests with the same prefix can
+                // reuse them. Only cache the page-aligned portion of the
+                // PROMPT (not generation), and only pages that came from
+                // *this* request's allocation (skipping the ones we got
+                // from the cache to begin with).
+                if let Some(cache) = &self.prefix_cache {
+                    let prompt_full_pages =
+                        req.prompt_tokens.len() / self.pages.page_size();
+                    if prompt_full_pages > req.cached_prefix_pages {
+                        let new_prompt_pages = &req.block_table
+                            [req.cached_prefix_pages..prompt_full_pages];
+                        let start_token =
+                            req.cached_prefix_pages * self.pages.page_size();
+                        tracing::debug!(
+                            "{}: inserting {} prompt pages into prefix cache",
+                            req.id,
+                            new_prompt_pages.len(),
+                        );
+                        cache.lock().insert(
+                            &req.prompt_tokens,
+                            start_token,
+                            req.prefix_chain_hash,
+                            new_prompt_pages,
+                        );
+                    }
+                }
                 self.pages.free_pages(req.block_table);
             }
         }

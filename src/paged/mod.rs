@@ -22,9 +22,11 @@
 //!   * [`scheduler`] — batch admission, decode loop, streaming dispatch
 
 pub mod pages;
+pub mod prefix_cache;
 pub mod qwen3;
 pub mod request;
 pub mod scheduler;
+pub mod spec;
 
 #[cfg(all(target_os = "macos", feature = "candle-metal"))]
 pub mod metal_kernels;

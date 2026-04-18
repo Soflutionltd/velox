@@ -17,6 +17,7 @@
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 // Mutex is still used for the free-list. The per-layer pools no longer
@@ -74,11 +75,17 @@ struct LayerPool {
 
 /// The full paged KV cache: one [`LayerPool`] per transformer layer, plus a
 /// shared free-list of physical pages.
+///
+/// Pages are reference-counted to support sharing: the prefix cache and any
+/// in-flight request that reuses a cached prefix page each hold a ref. A
+/// page is only returned to the free-list when its refcount reaches 0.
 pub struct PagedKvCache {
     cfg: PagedKvConfig,
     layers: Vec<LayerPool>,
     /// Free-list of physical page IDs, used as a stack (Vec::pop = O(1)).
     free: Mutex<Vec<u32>>,
+    /// Per-page refcount. Indexed by physical page id. 0 = free.
+    refcount: Vec<AtomicU32>,
     device: Device,
 }
 
@@ -106,6 +113,8 @@ impl PagedKvCache {
         let mut free: Vec<u32> = (0..cfg.num_pages as u32).rev().collect();
         free.shrink_to_fit();
 
+        let refcount: Vec<AtomicU32> = (0..cfg.num_pages).map(|_| AtomicU32::new(0)).collect();
+
         tracing::info!(
             "PagedKvCache: {} layers × {} pages × {} kv_heads × {} tokens × {} dim ({} dtype, {:.1} MB)",
             cfg.num_layers,
@@ -121,6 +130,7 @@ impl PagedKvCache {
             cfg,
             layers,
             free: Mutex::new(free),
+            refcount,
             device: device.clone(),
         })
     }
@@ -157,9 +167,9 @@ impl PagedKvCache {
         self.cfg.num_pages
     }
 
-    /// Allocate `n` physical pages. Returns `None` if not enough are free.
-    /// All-or-nothing: if it can't satisfy the full request, no pages are
-    /// taken (so the caller can decide to evict / wait).
+    /// Allocate `n` physical pages with refcount 1. Returns `None` if not
+    /// enough are free. All-or-nothing: if it can't satisfy the full
+    /// request, no pages are taken (so the caller can decide to evict / wait).
     pub fn alloc(&self, n: usize) -> Option<Vec<u32>> {
         let mut free = self.free.lock();
         if free.len() < n {
@@ -167,30 +177,68 @@ impl PagedKvCache {
         }
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            out.push(free.pop().expect("checked length above"));
+            let p = free.pop().expect("checked length above");
+            // Should be 0 (free); set to 1 (alive, one owner).
+            self.refcount[p as usize].store(1, Ordering::Release);
+            out.push(p);
         }
         Some(out)
     }
 
-    /// Return a single physical page to the free list. Idempotent on
-    /// out-of-range IDs (logged as a warning).
+    /// Increment the refcount of an already-alive page. Used by the prefix
+    /// cache when a request is admitted with a cache-hit prefix: the
+    /// request becomes a co-owner, so when it later releases its block
+    /// table the page stays alive (cache still holds a ref).
+    pub fn incref_pages<I: IntoIterator<Item = u32>>(&self, pages: I) {
+        for p in pages {
+            if (p as usize) >= self.cfg.num_pages {
+                tracing::warn!("incref_pages: page_id {} out of range", p);
+                continue;
+            }
+            // Must already be alive (rc ≥ 1). Debug check.
+            let prev = self.refcount[p as usize].fetch_add(1, Ordering::AcqRel);
+            debug_assert!(prev >= 1, "incref on free page {}", p);
+        }
+    }
+
+    /// Decrement refcount of one page; if it reaches 0, push back to free-list.
     pub fn free_page(&self, page_id: u32) {
         if (page_id as usize) >= self.cfg.num_pages {
             tracing::warn!("free_page: page_id {} out of range", page_id);
             return;
         }
-        self.free.lock().push(page_id);
+        let prev = self.refcount[page_id as usize].fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev >= 1, "free on already-free page {}", page_id);
+        if prev == 1 {
+            self.free.lock().push(page_id);
+        }
     }
 
     pub fn free_pages<I: IntoIterator<Item = u32>>(&self, pages: I) {
-        let mut free = self.free.lock();
+        let mut to_recycle: Vec<u32> = Vec::new();
         for p in pages {
             if (p as usize) >= self.cfg.num_pages {
                 tracing::warn!("free_pages: page_id {} out of range", p);
                 continue;
             }
-            free.push(p);
+            let prev = self.refcount[p as usize].fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(prev >= 1, "free on already-free page {}", p);
+            if prev == 1 {
+                to_recycle.push(p);
+            }
         }
+        if !to_recycle.is_empty() {
+            let mut free = self.free.lock();
+            free.extend(to_recycle);
+        }
+    }
+
+    /// Read-only refcount for a page. Mostly for tests / observability.
+    pub fn page_refcount(&self, page_id: u32) -> u32 {
+        self.refcount
+            .get(page_id as usize)
+            .map(|r| r.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     /// The full K pool for a layer, shape `[num_pages, num_kv_heads,

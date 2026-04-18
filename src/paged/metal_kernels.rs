@@ -543,6 +543,112 @@ kernel void NAME(                                                              \
 QMM_4BIT_TILED(qmm_4bit_tiled_f32,  float)
 QMM_4BIT_TILED(qmm_4bit_tiled_f16,  half)
 QMM_4BIT_TILED(qmm_4bit_tiled_bf16, bfloat)
+
+// =====================================================================
+//   qmm_4bit_tg  —  TM-amortized 4-bit GEMM (no shared mem, no barriers)
+// =====================================================================
+//
+// Each thread owns ONE column n and TM consecutive rows of M. It reads
+// 8 packed weights, dequantizes them ONCE, then applies them to ALL TM
+// X-rows. That amortizes the (qweight load + dequant) cost over TM
+// output cells, while keeping the same SIMD dispatch density as the
+// naive kernel (M*N output cells / TM threads = M*N/TM dispatched
+// threads, distributed across many SIMDs of TN threads each).
+//
+// Why this beats the naive M=1-per-thread layout when M is large:
+//   * naive : per (m, n) cell, full K dequant + K X reads
+//   * tg    : per (m_block, n) tile, full K dequant + TM*K X reads (with
+//             X reads broadcast across the SIMD because all TN threads
+//             read the SAME (m, kk) on each iteration)
+//
+// And it doesn't hurt at M=1: TM-1 rows are guarded out by `if m >=
+// m_dim break;`, leaving the same work as naive plus a small register
+// cost.
+//
+// Constraints:
+//   * N % TN == 0                       (Qwen3 N ∈ {1024, 2048, 3072})
+//   * K % BK == 0                       (always true for MLX-quant K)
+
+#define TM 2
+#define TN 32
+#define BK 64
+
+#define QMM_4BIT_TG(NAME, T)                                                   \
+kernel void NAME(                                                              \
+    device const T    *X              [[buffer(0)]],                           \
+    device const uint *qweight        [[buffer(1)]],                           \
+    device const T    *scales         [[buffer(2)]],                           \
+    device const T    *biases         [[buffer(3)]],                           \
+    device const T    *bias_vec       [[buffer(4)]],                           \
+    device       T    *Y              [[buffer(5)]],                           \
+    constant uint &m_dim              [[buffer(6)]],                           \
+    constant uint &n_dim              [[buffer(7)]],                           \
+    constant uint &k_dim              [[buffer(8)]],                           \
+    constant uint &group_size         [[buffer(9)]],                           \
+    constant uint &has_bias           [[buffer(10)]],                          \
+    uint3 tg_id                       [[threadgroup_position_in_grid]],        \
+    uint3 tid_v                       [[thread_position_in_threadgroup]]       \
+) {                                                                            \
+    uint tid     = tid_v.x;                                                    \
+    uint m_start = tg_id.x * TM;                                               \
+    uint n_start = tg_id.y * TN;                                               \
+    uint n       = n_start + tid;                                              \
+    if (n >= n_dim) { return; }                                                \
+                                                                               \
+    uint k_packed         = k_dim / 8u;                                        \
+    uint k_groups         = k_dim / group_size;                                \
+    uint groups_per_pkg   = group_size / 8u;                                   \
+                                                                               \
+    float acc[TM];                                                             \
+    for (uint i = 0; i < TM; i++) { acc[i] = 0.0; }                            \
+                                                                               \
+    for (uint kg = 0; kg < k_groups; kg++) {                                   \
+        float scale = (float)scales[n * k_groups + kg];                        \
+        float bias  = (float)biases[n * k_groups + kg];                        \
+        uint kp_start = kg * groups_per_pkg;                                   \
+        uint k_base   = kg * group_size;                                       \
+                                                                               \
+        for (uint kp = 0; kp < groups_per_pkg; kp++) {                         \
+            uint pkg = qweight[n * k_packed + kp_start + kp];                  \
+            uint k0  = k_base + kp * 8u;                                       \
+                                                                               \
+            float w0 = (float)((pkg      ) & 0xFu) * scale + bias;             \
+            float w1 = (float)((pkg >>  4) & 0xFu) * scale + bias;             \
+            float w2 = (float)((pkg >>  8) & 0xFu) * scale + bias;             \
+            float w3 = (float)((pkg >> 12) & 0xFu) * scale + bias;             \
+            float w4 = (float)((pkg >> 16) & 0xFu) * scale + bias;             \
+            float w5 = (float)((pkg >> 20) & 0xFu) * scale + bias;             \
+            float w6 = (float)((pkg >> 24) & 0xFu) * scale + bias;             \
+            float w7 = (float)((pkg >> 28) & 0xFu) * scale + bias;             \
+                                                                               \
+            for (uint mi = 0; mi < TM; mi++) {                                 \
+                uint m = m_start + mi;                                         \
+                if (m >= m_dim) { break; }                                     \
+                /* All TN threads in the SIMD read the SAME (m, k0+i) from X.*/\
+                /* That's a single device load broadcast across the SIMD.    */\
+                acc[mi] += (float)X[m * k_dim + k0     ] * w0                  \
+                         + (float)X[m * k_dim + k0 + 1u] * w1                  \
+                         + (float)X[m * k_dim + k0 + 2u] * w2                  \
+                         + (float)X[m * k_dim + k0 + 3u] * w3                  \
+                         + (float)X[m * k_dim + k0 + 4u] * w4                  \
+                         + (float)X[m * k_dim + k0 + 5u] * w5                  \
+                         + (float)X[m * k_dim + k0 + 6u] * w6                  \
+                         + (float)X[m * k_dim + k0 + 7u] * w7;                 \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+                                                                               \
+    float bv = (has_bias != 0u) ? (float)bias_vec[n] : 0.0;                    \
+    for (uint mi = 0; mi < TM; mi++) {                                         \
+        uint m = m_start + mi;                                                 \
+        if (m >= m_dim) { break; }                                             \
+        Y[m * n_dim + n] = (T)(acc[mi] + bv);                                  \
+    }                                                                          \
+}
+
+QMM_4BIT_TG(qmm_4bit_tg_f32,  float)
+QMM_4BIT_TG(qmm_4bit_tg_f16,  half)
+QMM_4BIT_TG(qmm_4bit_tg_bf16, bfloat)
 "#;
 
 /// Per-process cache of compiled MSL libraries / pipelines, keyed by the
@@ -1506,10 +1612,27 @@ fn qmm_4bit_tiled_kernel_name(dtype: DType) -> AnyResult<&'static str> {
     })
 }
 
-/// M_MAX in the tiled kernel — must match the MSL `#define M_MAX`.
+/// M_MAX in the SIMD-reduce tiled kernel — must match MSL `#define M_MAX`.
 const QMM_TILED_M_MAX: usize = 32;
-/// TK in the tiled kernel — must match the MSL `#define TK`.
+/// TK in the SIMD-reduce tiled kernel — must match MSL `#define TK`.
 const QMM_TILED_TK: usize = 32;
+
+fn qmm_4bit_tg_kernel_name(dtype: DType) -> AnyResult<&'static str> {
+    Ok(match dtype {
+        DType::F32 => "qmm_4bit_tg_f32",
+        DType::F16 => "qmm_4bit_tg_f16",
+        DType::BF16 => "qmm_4bit_tg_bf16",
+        other => bail!("qmm_4bit_tg: unsupported activation dtype {other:?}"),
+    })
+}
+
+/// Output row tile of the threadgroup-tiled kernel — matches MSL `#define TM`.
+const QMM_TG_TM: usize = 2;
+/// Output col tile of the threadgroup-tiled kernel — matches MSL `#define TN`.
+const QMM_TG_TN: usize = 32;
+/// K block of the threadgroup-tiled kernel — matches MSL `#define BK` AND
+/// the supported MLX-quant `group_size`.
+const QMM_TG_BK: usize = 64;
 
 /// Int4 weight × FP activation matmul (MLX-quant format).
 ///
@@ -1587,14 +1710,26 @@ pub fn qmm_4bit(
     }
 
     let out = Tensor::zeros((m, n), dtype, &device)?;
-    // The tiled kernel is currently slower than the naive one (the
-    // per-thread `acc[M_MAX]` array spills out of registers and the
-    // simd_sum reduction adds non-trivial overhead). The naive kernel
-    // gets ~9x scaling under batch=32 today, so we ship that and keep
-    // the tiled variant compiled but unused until we have a proper
-    // threadgroup-shared GEMM.
-    let _ = (qmm_4bit_tiled_kernel_name(dtype)?, QMM_TILED_M_MAX, QMM_TILED_TK);
+    // Dispatch policy:
+    //   * naive — 1 thread per output cell. Best on Apple GPUs at every
+    //             M tested (1, 8, 32) for Qwen3-shape workloads.
+    //   * tg / tiled — kept compiled but unused. Both lose to naive in
+    //                  benchmarks: tiled (SIMD-reduce) spills registers,
+    //                  tg (TM-amortized) under-saturates SIMDs at high M.
+    //                  Beating naive requires a real multi-SIMD-per-TG
+    //                  GEMM (à la mlx-c qmm), which is a much bigger
+    //                  undertaking. Tracked for a future Sprint.
+    let _ = (
+        qmm_4bit_tiled_kernel_name(dtype)?,
+        QMM_TILED_M_MAX,
+        QMM_TILED_TK,
+        qmm_4bit_tg_kernel_name(dtype)?,
+        QMM_TG_TM,
+        QMM_TG_TN,
+        QMM_TG_BK,
+    );
     let fn_name = qmm_4bit_kernel_name(dtype)?;
+    let use_tg = false;
     let pipeline = ensure_pipeline(&metal_dev, fn_name)?;
     let elem_bytes = dtype.size_in_bytes();
 
@@ -1666,19 +1801,35 @@ pub fn qmm_4bit(
         encoder.set_bytes(9, &g_u);
         encoder.set_bytes(10, &has_bias_u);
 
-        let grid = MTLSize {
-            width: m,
-            height: n,
-            depth: 1,
-        };
-        let tg_w = std::cmp::min(m, 8).max(1);
-        let tg_h = std::cmp::min(n, 32).max(1);
-        let tg = MTLSize {
-            width: tg_w,
-            height: tg_h,
-            depth: 1,
-        };
-        encoder.dispatch_threads(grid, tg);
+        if use_tg {
+            // TG-tiled: one threadgroup per (TM × TN) output tile,
+            // 32 threads per group (one SIMD).
+            let tg_count = MTLSize {
+                width: m.div_ceil(QMM_TG_TM),
+                height: n / QMM_TG_TN,
+                depth: 1,
+            };
+            let threads_per_tg = MTLSize {
+                width: QMM_TG_TN,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(tg_count, threads_per_tg);
+        } else {
+            let grid = MTLSize {
+                width: m,
+                height: n,
+                depth: 1,
+            };
+            let tg_w = std::cmp::min(m, 8).max(1);
+            let tg_h = std::cmp::min(n, 32).max(1);
+            let tg = MTLSize {
+                width: tg_w,
+                height: tg_h,
+                depth: 1,
+            };
+            encoder.dispatch_threads(grid, tg);
+        }
         drop(encoder);
     }
     Ok(out)

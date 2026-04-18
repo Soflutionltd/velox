@@ -62,6 +62,14 @@ pub struct Request {
     pub status: RequestStatus,
     pub created_at: Instant,
     pub admitted_at: Option<Instant>,
+    /// Number of pages at the start of `block_table` that came from the
+    /// prefix cache (already filled). The prefill skips them. Used at
+    /// completion time to avoid re-inserting pages the cache already has.
+    pub cached_prefix_pages: usize,
+    /// Chained hash *up to but not including* the first non-cached page.
+    /// Used to extend the cache chain when we register the freshly-prefilled
+    /// pages. `0` if no cache lookup ran.
+    pub prefix_chain_hash: u64,
     /// Channel to push streaming chunks back to the HTTP handler. The
     /// handler drops its receiver when the client disconnects, which we
     /// detect via `send_chunk()` returning `Err`.
