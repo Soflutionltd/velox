@@ -18,6 +18,24 @@ mod server;
 #[derive(Parser)]
 #[command(name = "velox", about = "Velox - The world's first Rust-native LLM inference server for Apple Silicon")]
 enum Cli {
+    /// Download a model into the local model directory.
+    ///
+    /// Accepts either a curated alias (e.g. `qwen3-0.6b`, `llama3-8b`) or a
+    /// full HuggingFace repo id (e.g. `mlx-community/Qwen3-4B-4bit`). Run
+    /// `velox pull --list` to see the curated catalog.
+    Pull {
+        /// Alias (e.g. `qwen3-0.6b`) or HF repo id. Omit when using --list.
+        model: Option<String>,
+
+        /// Where to install models. Each model lands in <dir>/<repo_id>.
+        #[arg(long, default_value = "~/.velox/models")]
+        model_dir: String,
+
+        /// Print the curated catalog and exit.
+        #[arg(long)]
+        list: bool,
+    },
+
     /// Start the inference server
     Serve {
         /// Directory containing MLX/GGUF models
@@ -68,6 +86,50 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli {
+        Cli::Pull { model, model_dir, list } => {
+            if list || model.is_none() {
+                model::catalog::print_catalog();
+                if model.is_none() && !list {
+                    eprintln!("\nNo model specified. Pass an alias or repo_id, or use --list.");
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
+            let model = model.unwrap();
+            let (repo_id, entry) = model::catalog::resolve(&model);
+            let model_dir = expand_tilde(&model_dir);
+            // Each model lives in its own subdir named after the repo's
+            // last path segment so multiple checkpoints don't collide.
+            let leaf = repo_id.rsplit('/').next().unwrap_or(&repo_id);
+            let target_dir = std::path::PathBuf::from(&model_dir).join(leaf);
+            std::fs::create_dir_all(&target_dir)?;
+
+            tracing::info!("Pulling {} → {:?}", repo_id, target_dir);
+            if let Some(e) = entry {
+                tracing::info!("  family={} approx_size={:.1}GB", e.family, e.size_gb);
+            }
+
+            let req = model::download::DownloadRequest {
+                repo_id: repo_id.clone(),
+                target_dir: target_dir.clone(),
+                revision: None,
+            };
+            let snapshot = model::download::download_model(&req, |p| {
+                eprintln!(
+                    "  [{:>3}/{:>3}] {}",
+                    p.files_done, p.files_total, p.current_file
+                );
+            })
+            .await?;
+
+            println!();
+            println!("✓ Model installed:");
+            println!("  repo:     {}", repo_id);
+            println!("  snapshot: {}", snapshot.display());
+            println!();
+            println!("Start the server with:");
+            println!("  velox serve --model-dir {}", model_dir);
+        }
         Cli::Serve {
             model_dir,
             port,
@@ -104,4 +166,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Expand a leading `~` in a path to `$HOME`. We keep this self-contained
+/// (rather than pulling in `dirs`) because it's the only place we need it.
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home)
+                .join(rest)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    p.to_string()
 }
