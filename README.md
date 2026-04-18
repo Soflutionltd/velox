@@ -2,9 +2,16 @@
 
 **The world's first Rust-native LLM inference server for Apple Silicon.**
 
-Single static binary. No Python, no Node, no GC. Continuous batching, paged KV cache,
-fused Metal kernels, MLX-Int4 quantization, prefix cache, speculative decoding.
+Single static binary. No Python, no Node, no GC. Built for **multi-tenant
+serving** — continuous batching, paged KV cache, fused Metal kernels, prefix
+cache for shared system prompts, MLX-Int4 quantization, speculative decoding.
 OpenAI- and Anthropic-compatible HTTP API.
+
+> **Where Velox shines:** serving N concurrent users from one model.
+> Measured **478 tok/s aggregate at 16 concurrent requests** on Qwen3-0.6B-4bit,
+> beating mlx-lm starting at 2 concurrent users.
+> See [BENCHMARKS.md](./BENCHMARKS.md) for the honest single-stream comparison
+> (mlx-lm wins solo; we're 5.5× slower until we ship fused decode kernels).
 
 ```
 $ velox serve --model Qwen3-4B-4bit
@@ -116,24 +123,55 @@ Sequential per-request backend (Candle's default, no paged optimisations):
 
 ## Benchmarks
 
-```bash
-# Run the head-to-head suite (auto-detects mlx-lm, llama.cpp, ollama):
-python3 scripts/bench_compare.py --tokens 200 --runs 3
-```
+See [BENCHMARKS.md](./BENCHMARKS.md) for the full head-to-head numbers
+(single-stream and concurrent), reproduction commands, and a transparent
+discussion of where each backend wins.
 
-Results table is appended to `scripts/bench_compare.md` for sharing.
+Quick summary on Qwen3-0.6B-4bit (Apple Silicon, MLX-Int4):
+
+| Mode | Velox | mlx-lm |
+|---|---:|---:|
+| Single-stream (1 user) | 49 tok/s | **271 tok/s** |
+| Concurrent @16 (16 users) | **478 tok/s aggregate** | N/A (single-stream only) |
+
+Run the comparison yourself:
+
+```bash
+python3 scripts/bench_compare.py \
+    --velox-model Qwen3-0.6B-4bit \
+    --mlx-model ~/.velox/models/Qwen3-0.6B-4bit \
+    --tokens 200 --runs 3
+```
 
 ## Roadmap
 
-Next up (in order):
+Single-stream perf (close the gap with mlx-lm):
 
-1. Tiled `qmm_4bit` v2 (multi-SIMD cooperative dequant) — batch-decode throughput
-2. KV cache quantization (int8 then int4) — bigger contexts, less RAM
-3. Long-context Llama 3.1 (NTK-scaling for 128K)
-4. Sliding-window attention (unlocks Gemma 2/3)
-5. Speculative decoding with a tiny dedicated draft (n-gram or Medusa)
-6. CUDA / NVIDIA support (separate backend, shared scheduler)
-7. Homebrew tap and signed macOS binary
+1. **Fused decode layer kernels** — one big Metal dispatch per layer instead
+   of ~14 small ones. Targets ~3× single-stream speedup.
+2. **Tiled `qmm_4bit` v2** — multi-SIMD cooperative dequant. Targets ~1.5×
+   on quant weights.
+3. **mistral.rs / mlx-rs alternative backends** — when stable.
+
+Concurrent perf (push the lead further):
+
+4. Larger `max_batch_tokens`, cross-request prefill chunking
+5. Speculative decoding with a tiny n-gram or Medusa draft
+
+Coverage / features:
+
+6. Phi-3 (split int4-aware fused weights)
+7. Sliding-window attention (unlocks Gemma 2/3, Mistral v0.1/0.2, Phi-3 long-ctx)
+8. Long-context Llama 3.1 (NTK-aware RoPE bands for 128K)
+9. KV cache quantization (int8 then int4) — bigger contexts, less RAM
+10. CUDA / NVIDIA backend (separate, shares the scheduler)
+
+Distribution:
+
+11. Unix domain socket transport (no HTTP overhead for local apps)
+12. gRPC server (`tonic`) alongside HTTP
+13. Homebrew tap and signed macOS binary
+14. Landing page + Show HN
 
 ## Project layout
 
