@@ -17,9 +17,12 @@
 
 use super::pages::PagedKvCache;
 use anyhow::{anyhow, Context, Result};
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{linear_b, linear_no_bias, rms_norm, Activation, Embedding, Linear, RmsNorm, VarBuilder};
 use std::sync::Arc;
+
+#[cfg(all(target_os = "macos", feature = "candle-metal"))]
+use super::metal_kernels::ScatterSlot;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Qwen3Config {
@@ -337,8 +340,8 @@ impl PagedQwen3Attention {
             let k_t = k.narrow(1, t, 1)?.squeeze(1)?; // [H_kv, D]
             let v_t = v.narrow(1, t, 1)?.squeeze(1)?;
 
-            k_guard[page_id] = scatter_slot_in_page(&k_guard[page_id], &k_t, slot)?;
-            v_guard[page_id] = scatter_slot_in_page(&v_guard[page_id], &v_t, slot)?;
+            scatter_into_page(&mut k_guard[page_id], &k_t, slot)?;
+            scatter_into_page(&mut v_guard[page_id], &v_t, slot)?;
         }
 
         Ok(())
@@ -413,27 +416,47 @@ fn build_causal_mask(
         .map_err(Into::into)
 }
 
-/// Replace one slot of a single page tensor `[H_kv, page_size, D]` with
-/// `value` of shape `[H_kv, D]`. Returns a NEW tensor (Candle is immutable).
-/// Cost: O(H_kv * page_size * D), independent of `num_pages`.
-fn scatter_slot_in_page(page: &Tensor, value: &Tensor, slot: usize) -> Result<Tensor> {
+/// Replace one `[H_kv, D]` slot inside a `[H_kv, page_size, D]` page,
+/// in place when running on Metal (custom MSL kernel, O(H_kv * D) work,
+/// no allocation), or via a `cat(pre, mid, post)` fallback elsewhere.
+///
+/// `value` does NOT need to be contiguous; we'll make it contiguous
+/// before handing it to the kernel.
+fn scatter_into_page(page: &mut Tensor, value: &Tensor, slot: usize) -> Result<()> {
     let (h, s, d) = page.dims3()?;
     debug_assert!(slot < s);
     debug_assert_eq!(value.dims2()?, (h, d));
 
+    #[cfg(all(target_os = "macos", feature = "candle-metal"))]
+    {
+        if matches!(page.device(), Device::Metal(_)) {
+            let value = value.contiguous()?;
+            page.inplace_op2(
+                &value,
+                &ScatterSlot {
+                    slot: slot as u32,
+                },
+            )?;
+            return Ok(());
+        }
+    }
+
     let middle = value.reshape((h, 1, d))?;
-    if s == 1 {
-        return Ok(middle);
-    }
-    let mut parts: Vec<Tensor> = Vec::with_capacity(3);
-    if slot > 0 {
-        parts.push(page.narrow(1, 0, slot)?);
-    }
-    parts.push(middle);
-    if slot + 1 < s {
-        parts.push(page.narrow(1, slot + 1, s - slot - 1)?);
-    }
-    Tensor::cat(&parts, 1).map_err(Into::into)
+    let new_page = if s == 1 {
+        middle
+    } else {
+        let mut parts: Vec<Tensor> = Vec::with_capacity(3);
+        if slot > 0 {
+            parts.push(page.narrow(1, 0, slot)?);
+        }
+        parts.push(middle);
+        if slot + 1 < s {
+            parts.push(page.narrow(1, slot + 1, s - slot - 1)?);
+        }
+        Tensor::cat(&parts, 1)?
+    };
+    *page = new_page;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

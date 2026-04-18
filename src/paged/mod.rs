@@ -26,6 +26,9 @@ pub mod qwen3;
 pub mod request;
 pub mod scheduler;
 
+#[cfg(all(target_os = "macos", feature = "candle-metal"))]
+pub mod metal_kernels;
+
 pub use pages::{PagedKvCache, PagedKvConfig};
 pub use request::{Request, RequestId, RequestSnapshot, RequestStatus};
 pub use scheduler::{BatchScheduler, SchedulerConfig};

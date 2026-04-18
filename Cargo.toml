@@ -47,6 +47,10 @@ tokenizers = { version = "0.22", optional = true }
 candle-core = { version = "0.10", optional = true }
 candle-nn = { version = "0.10", optional = true }
 candle-transformers = { version = "0.10", optional = true }
+# Used by our custom paged-attention Metal kernels (compiled MSL + dispatch).
+# Re-exports the same metal abstractions that candle-core uses internally.
+candle-metal-kernels = { version = "0.10", optional = true }
+objc2-metal = { version = "0.3", optional = true }
 # Jinja2-compatible templating for HF tokenizer chat templates
 minijinja = { version = "2", optional = true, features = ["loader"] }
 minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
@@ -66,7 +70,7 @@ hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rust
 # On Apple Silicon, the default is Candle + Metal GPU acceleration.
 default = ["candle-metal"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib"]
-candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+candle-metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 mlx = ["dep:mlx-rs", "dep:mlx-lm", "dep:mlx-lm-utils", "dep:tokenizers"]
 llamacpp = []
 
