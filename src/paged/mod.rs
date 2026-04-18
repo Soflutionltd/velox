@@ -22,6 +22,7 @@
 //!   * [`scheduler`] — batch admission, decode loop, streaming dispatch
 
 pub mod llama;
+pub mod dyn_quant;
 pub mod pages;
 pub mod prefix_cache;
 pub mod qwen3;
