@@ -144,6 +144,10 @@ impl CandleBackend {
                 crate::paged::llama::load_paged_llama(path, vb)
                     .map_err(|e| anyhow::anyhow!("load_paged_llama: {e}"))?,
             ),
+            "phi3" => Arc::new(
+                crate::paged::phi3::load_paged_phi3(path, vb)
+                    .map_err(|e| anyhow::anyhow!("load_paged_phi3: {e}"))?,
+            ),
             other => anyhow::bail!("paged backend does not (yet) support arch={}", other),
         };
         let cfg = model.config().clone();
@@ -220,7 +224,7 @@ impl InferenceBackend for CandleBackend {
             // Qwen3, Llama 3.x and Mistral all take the paged-attention
             // path with continuous batching. Other architectures fall
             // back to the sequential per-request path below.
-            if matches!(arch.as_str(), "qwen3" | "llama" | "mistral") {
+            if matches!(arch.as_str(), "qwen3" | "llama" | "mistral" | "phi3") {
                 let paged = Self::build_paged(&path_buf, &device, &arch)?;
                 let id = uuid::Uuid::new_v4().to_string();
                 let handle = ModelHandle {

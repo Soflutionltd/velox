@@ -122,10 +122,33 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
 
+            // hf-hub stores files inside `target_dir/models--<user>--<repo>/snapshots/<rev>/`
+            // as symlinks to the blob store. The Velox model loader expects
+            // a flat layout (`config.json`, `model.safetensors`, ...) directly
+            // inside the model dir, so we mirror the snapshot via symlinks.
+            // Symlinks (not copies) are intentional: zero extra disk and the
+            // blob store is canonical.
+            let mut linked = 0usize;
+            for entry in std::fs::read_dir(&snapshot)? {
+                let entry = entry?;
+                let src = entry.path();
+                let name = entry.file_name();
+                let dst = target_dir.join(&name);
+                if dst.exists() {
+                    let _ = std::fs::remove_file(&dst);
+                }
+                if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                    eprintln!("  warning: symlink {name:?} → {e}");
+                } else {
+                    linked += 1;
+                }
+            }
+
             println!();
             println!("✓ Model installed:");
             println!("  repo:     {}", repo_id);
-            println!("  snapshot: {}", snapshot.display());
+            println!("  path:     {}", target_dir.display());
+            println!("  files:    {} linked from snapshot", linked);
             println!();
             println!("Start the server with:");
             println!("  velox serve --model-dir {}", model_dir);

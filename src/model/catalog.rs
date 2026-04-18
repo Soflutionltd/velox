@@ -83,6 +83,14 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_gb: 4.1,
         note: "Mistral 7B v0.2 (sliding window 4096).",
     },
+    // Phi-3 (paged backend via load_paged_phi3).
+    CatalogEntry {
+        alias: "phi3-mini",
+        repo_id: "mlx-community/Phi-3-mini-4k-instruct-4bit",
+        family: "phi3",
+        size_gb: 2.2,
+        note: "Microsoft Phi-3 mini (3.8B), 4k context.",
+    },
 ];
 
 pub fn resolve(alias_or_repo: &str) -> (String, Option<&'static CatalogEntry>) {
